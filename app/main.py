@@ -1,0 +1,220 @@
+import base64
+import hashlib
+import json
+import subprocess
+import sys
+import uuid
+from datetime import date
+from pathlib import Path
+from typing import Annotated, Literal
+
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, Response, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
+from sqlalchemy import case, func, select
+from sqlalchemy.dialects.postgresql import insert
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import Session
+
+from .config import settings
+from .db import get_db
+from .matching import FIELDS, review, transaction_view
+from .models import Account, SourceLink, Statement, StatementRow, Transaction
+from .schemas import AccountView, Confirmation, Decisions, ImportView, TransactionList
+
+app = FastAPI(title="Bini · Bank statement ledger", version="0.1.0")
+app.add_middleware(CORSMiddleware, allow_origins=settings.allowed_origins,
+                   allow_methods=["GET", "POST", "PATCH", "DELETE"], allow_headers=["Content-Type"])
+DB = Annotated[Session, Depends(get_db)]
+
+
+@app.get("/api/health")
+def health(db: DB):
+    db.execute(select(1))
+    return {"status": "ok"}
+
+
+def statement_or_404(db, statement_id, lock=False):
+    statement = db.get(Statement, statement_id)
+    if statement is None:
+        raise HTTPException(404, "Import not found.")
+    if lock:
+        # All modifying paths lock account then statement in the same order.
+        db.scalar(select(Account).where(Account.id == statement.account_id).with_for_update().execution_options(populate_existing=True))
+        statement = db.scalar(select(Statement).where(Statement.id == statement_id).with_for_update().execution_options(populate_existing=True))
+        if statement is None:
+            raise HTTPException(404, "Import not found.")
+    return statement
+
+
+def process_pdf(data, password):
+    payload = json.dumps({"pdf": base64.b64encode(data).decode(), "password": password})
+    try:
+        result = subprocess.run([sys.executable, "-m", "app.parser_worker"], input=payload,
+            capture_output=True, text=True, timeout=60, cwd=Path(__file__).resolve().parents[1])
+    except subprocess.TimeoutExpired:
+        raise HTTPException(408, "PDF processing exceeded 60 seconds. No transactions were saved.") from None
+    if result.returncode:
+        raise HTTPException(422, "PDF processing failed. No transactions were saved.")
+    try:
+        output = json.loads(result.stdout)
+    except ValueError:
+        raise HTTPException(422, "Unable to read the PDF processing result.") from None
+    if "error" in output:
+        raise HTTPException(422, output["error"])
+    return output["result"]
+
+
+@app.post("/api/imports", response_model=ImportView)
+def upload(db: DB, file: UploadFile = File(...), password: str = Form("")):
+    data = file.file.read(10 * 1024 * 1024 + 1)
+    if len(data) > 10 * 1024 * 1024:
+        raise HTTPException(413, "PDF must be at most 10 MB.")
+    fingerprint = hashlib.sha256(data).hexdigest()
+    previous = db.scalar(select(Statement).where(Statement.fingerprint == fingerprint))
+    if previous:
+        return review(db, previous)
+    parsed = process_pdf(data, password)
+    del password
+    try:
+        statement = persist_import(db, file, data, fingerprint, parsed)
+    except IntegrityError:
+        db.rollback()
+        statement = db.scalar(select(Statement).where(Statement.fingerprint == fingerprint))
+        if statement is None:
+            raise
+    return review(db, statement)
+
+
+def persist_import(db, file, data, fingerprint, parsed):
+    account_id = db.scalar(insert(Account).values(
+        id=uuid.uuid4(), bank="EBL", identifier=parsed["identifier"], currency="BDT",
+        label="EBL · •••• " + parsed["identifier"][-4:], revision=0,
+    ).on_conflict_do_nothing(index_elements=["bank", "identifier", "currency"]).returning(Account.id))
+    if account_id is None:
+        account_id = db.scalar(select(Account.id).where(Account.bank == "EBL", Account.identifier == parsed["identifier"], Account.currency == "BDT"))
+    statement = Statement(account_id=account_id, fingerprint=fingerprint,
+        filename=Path(file.filename or "statement.pdf").name[:255], original_pdf=data,
+        period_from=date.fromisoformat(parsed["period_from"]), period_to=date.fromisoformat(parsed["period_to"]),
+        opening_balance=parsed["opening_balance"], closing_balance=parsed["closing_balance"],
+        controls=parsed["controls"], checks=parsed["checks"])
+    db.add(statement)
+    db.flush()
+    for source in parsed["rows"]:
+        source["posting_date"] = date.fromisoformat(source["posting_date"])
+        db.add(StatementRow(statement_id=statement.id, **source))
+    db.commit()
+    return statement
+
+
+@app.get("/api/imports/{statement_id}", response_model=ImportView)
+def get_import(statement_id: uuid.UUID, db: DB):
+    return review(db, statement_or_404(db, statement_id))
+
+
+@app.patch("/api/imports/{statement_id}/decisions", response_model=ImportView)
+def decisions(statement_id: uuid.UUID, body: Decisions, db: DB):
+    statement = statement_or_404(db, statement_id, lock=True)
+    if statement.status != "draft":
+        raise HTTPException(409, "Confirmed imports cannot be edited.")
+    current = review(db, statement)
+    proposals = {row["id"]: row for row in current["rows"]}
+    if len({decision.row_id for decision in body.decisions}) != len(body.decisions):
+        raise HTTPException(422, "Each source row can have only one decision.")
+    for decision in body.decisions:
+        if decision.row_id not in proposals:
+            raise HTTPException(422, "Source row does not belong to this import.")
+        if decision.decision == "match" and decision.transaction_id not in {c["id"] for c in proposals[decision.row_id]["candidates"]}:
+            raise HTTPException(422, "Match must have the same account, posting date, direction and amount.")
+        row = db.get(StatementRow, decision.row_id)
+        row.decision, row.match_id = decision.decision, decision.transaction_id
+    statement.review_revision += 1
+    db.commit()
+    return review(db, statement)
+
+
+@app.post("/api/imports/{statement_id}/confirm", response_model=ImportView)
+def confirm(statement_id: uuid.UUID, body: Confirmation, db: DB):
+    statement = statement_or_404(db, statement_id, lock=True)
+    if statement.status == "confirmed":
+        return review(db, statement)
+    current = review(db, statement)
+    if current["revision"] != body.expected_revision:
+        raise HTTPException(409, "The account changed since this review. Refresh the review and confirm again.")
+    if not current["can_confirm"]:
+        raise HTTPException(409, "Resolve duplicate decisions and reconciliation failures before confirming.")
+    for proposal in current["rows"]:
+        row = db.get(StatementRow, proposal["id"])
+        if proposal["effective"] == "new":
+            transaction = Transaction(account_id=statement.account_id,
+                **{field: getattr(row, field) for field in (*FIELDS, "description")})
+            db.add(transaction)
+            db.flush()
+            target = transaction.id
+        else:
+            target = proposal["target_id"]
+        row.decision, row.match_id = proposal["effective"], target
+        db.add(SourceLink(transaction_id=target, statement_row_id=row.id))
+    statement.status = "confirmed"
+    db.get(Account, statement.account_id).revision += 1
+    db.commit()
+    return review(db, statement)
+
+
+@app.delete("/api/imports/{statement_id}", status_code=204)
+def cancel(statement_id: uuid.UUID, db: DB):
+    statement = statement_or_404(db, statement_id, lock=True)
+    if statement.status == "confirmed":
+        raise HTTPException(409, "Confirmed imports cannot be cancelled.")
+    db.delete(statement)
+    db.commit()
+    return Response(status_code=204)
+
+
+@app.get("/api/accounts", response_model=list[AccountView])
+def accounts(db: DB):
+    return [{"id": a.id, "label": a.label, "currency": a.currency} for a in db.scalars(select(Account).order_by(Account.label, Account.id))]
+
+
+@app.get("/api/transactions", response_model=TransactionList)
+def transactions(db: DB, search: str = Query("", max_length=500), from_date: date | None = None,
+                 to_date: date | None = None, direction: Literal["debit", "credit"] | None = None,
+                 account_id: uuid.UUID | None = None, page: int = Query(1, ge=1),
+                 page_size: int = Query(50, ge=1, le=200),
+                 sort: Literal["date_desc", "date_asc", "amount_desc", "amount_asc"] = "date_desc"):
+    if from_date and to_date and from_date > to_date:
+        raise HTTPException(422, "From date must not be after to date.")
+    filters = []
+    if search:
+        filters.append(Transaction.description.icontains(search, autoescape=True))
+    if from_date: filters.append(Transaction.posting_date >= from_date)
+    if to_date: filters.append(Transaction.posting_date <= to_date)
+    if direction: filters.append(Transaction.direction == direction)
+    if account_id: filters.append(Transaction.account_id == account_id)
+    # One repeatable-read snapshot keeps rows, counts and totals consistent.
+    db.connection(execution_options={"isolation_level": "REPEATABLE READ"})
+    total, debit, credit = db.execute(select(
+        func.count(Transaction.id),
+        func.coalesce(func.sum(case((Transaction.direction == "debit", Transaction.amount), else_=0)), 0),
+        func.coalesce(func.sum(case((Transaction.direction == "credit", Transaction.amount), else_=0)), 0),
+    ).where(*filters)).one()
+    order = {"date_desc": Transaction.posting_date.desc(), "date_asc": Transaction.posting_date.asc(),
+             "amount_desc": Transaction.amount.desc(), "amount_asc": Transaction.amount.asc()}[sort]
+    items = db.scalars(select(Transaction).where(*filters).order_by(order, Transaction.id.desc()).offset((page-1)*page_size).limit(page_size))
+    return {"items": [transaction_view(t) for t in items], "total": total, "page": page,
+            "page_size": page_size, "debit_total": debit, "credit_total": credit, "net": credit-debit}
+
+
+@app.get("/api/transactions/{transaction_id}")
+def transaction_detail(transaction_id: uuid.UUID, db: DB):
+    transaction = db.get(Transaction, transaction_id)
+    if transaction is None:
+        raise HTTPException(404, "Transaction not found.")
+    sources = db.execute(select(StatementRow, Statement).join(SourceLink, SourceLink.statement_row_id == StatementRow.id)
+        .join(Statement, Statement.id == StatementRow.statement_id).where(SourceLink.transaction_id == transaction_id)
+        .order_by(Statement.created_at, StatementRow.ordinal))
+    # Explicit decimal strings also on the detail endpoint.
+    output = transaction_view(transaction)
+    output.update(amount=str(transaction.amount), balance=str(transaction.balance))
+    output["sources"] = [{"statement_id": s.id, "filename": s.filename, "page": r.page,
+                          "ordinal": r.ordinal, "raw_text": r.raw_text, "location": r.location} for r, s in sources]
+    return output

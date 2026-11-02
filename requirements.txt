@@ -1,0 +1,9 @@
+fastapi>=0.115,<1
+uvicorn>=0.30,<1
+SQLAlchemy>=2.0,<2.1
+alembic>=1.13,<2
+psycopg[binary]>=3.2,<4
+pydantic-settings>=2.5,<3
+python-multipart>=0.0.18,<1
+pypdf[crypto]>=6,<7
+pdfplumber>=0.11,<0.12

@@ -1,0 +1,38 @@
+# Python environments and generated files
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+build/
+dist/
+*.egg-info/
+
+# Test, lint, and coverage output
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+
+# Local configuration; sanitized templates stay versioned
+.env
+.env.*
+!.env.example
+!.env.*.example
+
+# Private bank documents, credentials, and local storage/backups
+sample/
+samples/
+uploads/
+data/
+backups/
+*.pdf
+*.dump
+*.backup
+password.txt
+passwords.txt
+*.log
+.DS_Store

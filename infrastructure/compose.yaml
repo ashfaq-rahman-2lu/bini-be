@@ -1,0 +1,20 @@
+# Stable identity preserves the existing database volume across repository moves.
+name: bini-io
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: bini
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-bini_local_only}
+      POSTGRES_DB: bini
+    ports:
+      - "127.0.0.1:55433:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U bini -d bini"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+volumes:
+  postgres_data:
