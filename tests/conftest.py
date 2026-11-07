@@ -25,7 +25,7 @@ from app.main import app
 @pytest.fixture(autouse=True)
 def empty_ledger():
     with engine.begin() as connection:
-        connection.execute(text("TRUNCATE source_links, statement_rows, transactions, statements, accounts CASCADE"))
+        connection.execute(text("TRUNCATE investment_institutions, source_links, statement_rows, transactions, statements, accounts CASCADE"))
 
 
 @pytest.fixture

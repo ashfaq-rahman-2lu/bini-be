@@ -32,19 +32,28 @@ If port 8000 is occupied, choose another API port and set `API_PROXY_TARGET=http
 
 ## Import and review
 
-1. Choose **Import statement**, select one EBL BDT PDF, and enter its password.
-2. Review the extracted rows, financial checks, and duplicate proposals.
-3. For ambiguous rows, select an existing transaction or keep the occurrence separately.
-4. Confirm the import to add new transactions and link every supporting source occurrence.
-5. Filter the ledger by description, inclusive posting-date range, direction, and account.
+1. Choose **Import statement**, select up to 20 EBL BDT PDFs, and enter a shared password or individual passwords.
+2. Files are uploaded sequentially through `POST /api/imports`. Each successful file becomes a separate draft; failures do not stop later files. Retry failed files with corrected passwords.
+3. Open each draft from the result cards or **Recent imports**, then review its rows, financial checks, and duplicate proposals.
+4. For ambiguous rows, select an existing transaction or keep the occurrence separately.
+5. Confirm the import to add new transactions and link every supporting source occurrence.
+6. Filter the ledger by description, inclusive posting-date range, direction, and account.
 
-The import limit is 10 MB / 50 pages, with a 60-second parser process timeout. Scanned PDFs and other bank layouts are rejected. Reconciliation failures cannot be overridden; inspect the source text and correct the parser before retrying. Opening balances, summaries, watermarks, and unsettled-card rows do not become posted transactions.
+The per-file import limit is 10 MB / 50 pages, with a 60-second parser process timeout. Scanned PDFs and other bank layouts are rejected. Reconciliation failures cannot be overridden; inspect the source text and correct the parser before retrying. Opening balances, summaries, watermarks, and unsettled-card rows do not become posted transactions.
 
 Matching uses account, posting date, direction, amount, balance, normalized full description, and reference evidence. Similar date/description/amount alone never triggers merging. Multiple source rows cannot silently map to one transaction. Confirmation locks the account, checks the review revision, and commits atomically. Repeated confirmation is safe. Concurrent changes return a refreshed review that must be confirmed again.
 
-The original PDF bytes and source text are retained in PostgreSQL; decrypted PDF copies are not written. Passwords travel only through request/process memory and are not stored in the database, logs, browser storage, or command arguments. Source text and metadata remain sensitive local data. Cancelling deletes an unconfirmed statement and its rows. Confirmed imports cannot be edited or deleted in this release.
+Imported PDF bytes and source text are retained in PostgreSQL. Protected imports are not decrypted to disk; if you choose an already unlocked PDF, those uploaded bytes are stored as the source. Passwords travel only through request/process memory and are not stored in the database, logs, browser storage, or command arguments. Source text and metadata remain sensitive local data. Cancelling deletes an unconfirmed statement and its rows. Confirmed imports cannot be edited or deleted in this release.
 
 Money uses Python Decimal / PostgreSQL NUMERIC(18,2), with decimal strings in JSON. UI totals cover the whole filtered result, not only the current page. Running balances are statement-provided, and net movement is not automatically classified as income or expenses.
+
+## PDF unlock tool and saved imports
+
+`POST /api/pdfs/unlock` accepts a PDF and its password and returns an unencrypted PDF attachment. It supports PDFs independently of the EBL parser, including scanned documents, with the same 10 MB / 50-page limits and a 60-second process timeout. It clones the document tree to retain page content, metadata, outlines, and form fields. Rewriting a PDF may invalidate an existing digital signature.
+
+This endpoint has no database dependency. The backend does not persist its password or decrypted output. The frontend offers a download for the user to save to their computer; it does not put PDF contents or passwords in browser localStorage. The download response uses `Cache-Control: no-store`. Downloaded copies are unencrypted.
+
+`GET /api/imports` lists the latest 50 saved drafts/confirmed imports (configurable `limit`, maximum 100), so reviews remain accessible after navigating away or reloading. It returns only ID, filename, status, and creation time. Each confirmation still rechecks matching and the account revision; a multi-file upload does not automatically confirm any draft. No database migration is required for these features.
 
 ## Tests
 
@@ -85,6 +94,58 @@ Restore into a separate, empty database with `pg_restore`; validate before switc
 - `tests/`: synthetic financial/import/concurrency tests and optional private-sample checks.
 - `infrastructure/compose.yaml`: dedicated local PostgreSQL service and persistent volume.
 
-Deferred: authentication/registration, public hosting, Excel export, batch uploads, categories, notes, inline extraction editing, PDF viewer, OCR, other banks, and investment CSV imports. GraphQL is not required for the initial REST workflow. The parser and financial services can support an additional interface later without duplicating business rules.
+Deferred: authentication/registration, public hosting, Excel export, categories, notes, inline extraction editing, PDF viewer, OCR, and other banks. GraphQL is not required for the REST workflow.
 
 The backend `.gitignore` independently excludes Python environments, caches, local environment files, private PDFs/password files, uploads, data, and backups, including infrastructure-local files. Commit source, migrations, requirements/lockfiles, tests, `.env.example`, and `infrastructure/compose.yaml`. Keep real statements and secrets outside version control.
+
+## Investment tracking
+
+Apply migrations through `0004` with `.venv/bin/alembic upgrade head` and restart an API process running without `--reload`. Migration `0003` adds seven investment tables; `0004` adds extend/replace import modes and updates document uniqueness. Existing imports default to extend; neither migration deletes application rows or rewrites the bank ledger. No additional packages or infrastructure are required.
+
+Use **Investments → Import investment CSV** for the institution's multiline UTF-8 BDT export (maximum 2 MB / 10,000 rows). Review the extracted transactions and warnings before confirming. Drafts do not affect investment totals. Cancelling removes draft source data. Confirmed CSV bytes, parsed original columns, and source row references are retained privately in PostgreSQL. No downloaded CSV or password is bundled with either repository.
+
+Choose **Extend existing data** (the default) to retain existing movements, projects, principal/profit classifications, money traces and bank matches. Institution name plus the full campaign name/number identifies a project. An identical extend document is reused; regenerated overlapping exports match full normalized records, including the reported wallet/capital balances, preserving repeated occurrence counts. Changed full records are shown as new; inspect previews before confirming. Date/amount alone is never used to merge records.
+
+Choose **Replace existing data** to rebuild only the named institution from the supplied CSV. Use complete history: movements/projects absent from the CSV are removed. The preview shows counts of movements, projects, other imports/previews, saved splits, traces and bank matches to remove. Confirmation requires both the ordinary review acknowledgment and `acknowledge_replace: true`. It removes the institution's old source imports (including other pending previews), movements, project statuses/expected targets, classifications, allocations and bank links before importing fresh records. Bank accounts/statements/transactions and other institutions are unchanged. Uploading or cancelling a replacement draft does not change the ledger. Replacement deletion and recreation share one transaction and the existing investment write lock; any error rolls everything back. Stale reviews must refresh; other previews removed by a completed replacement must be uploaded again.
+
+Confirmation is idempotent for an import ID. A repeated confirmation does not replace again. Uploading the same CSV again in replace mode deliberately creates/reuses a pending replacement, even if that file was confirmed before; this supports restoring a full archive after later extensions. Only one draft per institution/document/mode is kept, with confirmed and draft replacement generations allowed to coexist until confirmation removes the old reports.
+
+Financial definitions:
+
+- **External funding** includes BANK_TRANSFER investments only. **Total invested** also includes REINVESTMENT funding.
+- **Repayments** contain capital and profit. They are unclassified until a principal/profit split is explicitly saved. Source profit notes remain separate evidence, because they may describe a different period or a cumulative payment.
+- **Principal outstanding** for an active project is investment funding less classified returned principal and capital refunds. It is unavailable while any repayment remains unclassified or classified principal exceeds recorded funding. It assumes the recorded investment history is complete. A closed, finally settled project has no outstanding claim; unreturned classified principal is shown as capital written off, separately from final net gain/loss.
+- **Final gain/loss** equals repayments plus capital refunds less all project investment funding, including reinvestment funding. It is shown only after the user confirms complete history and final settlement and closes a project. Final ROI uses that project's total funding, is not annualized, and is unavailable for projects without recorded funding. Closing can recognize a capital loss; it does not fabricate installment splits.
+- **Returns less investments** shows cash recovery, not an active project's estimated loss. Expected total repayments are an optional user target, separate from actual returns.
+- **Wallet balance** is the final value in the latest confirmed report, with its as-of date. Untraced returns are a missing attribution, not an available-wallet balance.
+- **Disbursed / reinvestment** settles the wallet funding entry. It is neither another investment nor a bank payout. Daily reinvestment funding and settlement totals must agree. Only **Disbursed / cashout** counts as a provider bank payout.
+
+The parser checks monetary precision, types, chronological order, summary/TOTAL controls, wallet movements, and reported business-capital movements. A partial export may infer nonzero opening balances, which produce warnings about missing history. The provider's “Capital With Business” subtracts complete repayments, including profit; it must not be interpreted as outstanding principal. Negative reported wallet values and the supplied summary/capital discrepancy are retained with warnings. Nonzero protection-pool activity is rejected explicitly pending a dedicated model.
+
+Monetary cells accept both Western (`138,920`) and Indian (`1,38,920`) grouping, with at most two decimal places. Column G also accepts the CSV updater's running `=SUM($F$20:F20)-SUM($C$20:C20)` formulas (using the actual first/current CSV record numbers), and TOTAL may reference the final transaction's G cell. The parser computes these specific formulas with Decimal arithmetic, validates their references, and retains the original formula text as source evidence; arbitrary formulas are rejected. Summary rows padded with empty columns are still validated. Corrected repayments must reconcile with summary/TOTAL controls and column J; the importer does not silently repair inconsistent source balances.
+
+TOTAL's repayment cell F also accepts `=SUM(F20:F90)` using the actual first/final transaction record numbers. The “Total Repaid (from campaigns)” summary amount may reference that exact TOTAL cell (for example `=F91`). Both resolve to Decimal monetary values for validation; incorrect ranges, references to other cells, and arbitrary expressions are rejected. Numeric repayment controls remain supported, and unchanged transactions retain the same duplicate identities across numeric/formula exports.
+
+Column J accepts the updater's `=SUM($D$20:D20)-SUM($E$20:E20)-SUM($F$20:F20)` running capital formula, optionally followed by a signed opening capital amount such as `+250.00` for partial history. TOTAL's J may reference the final transaction (for example `=J90`). References and monetary bounds are validated, Decimal arithmetic resolves the values, and running-capital reconciliation still blocks inconsistent opening amounts across rows. Original formulas remain in source evidence; equivalent numeric/formula records have identical duplicate signatures. This follows the provider's capital convention, not classified principal outstanding.
+
+Summary “Ready Balance” accepts a reference to TOTAL's G cell (for example `=G91`); “Total Currently Invested” accepts the sum of TOTAL's J and G cells (`=J91+G91`). The parser validates both references against the actual TOTAL record, resolves them with Decimal arithmetic, and rejects arbitrary expressions. Numeric summaries remain supported: Ready Balance must reconcile exactly, while a differing numeric Total Currently Invested produces a warning against final capital with business **plus** ready balance. Formula and equivalent numeric summaries do not change transaction duplicate identities.
+
+Trace returned funds by allocating an installment/refund to one or more later reinvestments or cashouts. A destination can combine multiple source returns. The CSV's pooled wallet does not establish this attribution automatically. Traces cannot exceed either side, cross institutions, or consume future returns. Follow a cashout trace to its bank links to see whether the payout actually appears in the bank ledger. Remove incorrect traces/links before replacing them.
+
+Bank suggestions use BDT and the correct debit/credit direction. For an external investment booked on July 2, the default search includes bank debits June 29–July 2. Cashouts search bank credits from the payout date through three days later. The UI can widen the window to 30 days or look up a bank transaction ID manually. Multiple candidates always require a choice. Split/combined transfers use explicit link amounts; a bank transaction's capacity is shared across all investment events and institutions. A PostgreSQL advisory transaction lock serializes all investment mutations to prevent concurrent over-allocation; bank transactions themselves are unchanged.
+
+REST endpoints:
+
+- `GET /api/investments` — consistent project totals, activity, source references, traces and bank links.
+- `GET/POST /api/investments/imports`, `GET/DELETE /api/investments/imports/{id}`, `POST /api/investments/imports/{id}/confirm` — saved review workflow.
+- `PATCH /api/investments/projects/{id}` — status and optional expected total; closing requires `complete_history: true`.
+- `PATCH /api/investments/events/{id}/split` — explicit principal amount, or `null` to clear classification.
+- `POST /api/investments/allocations`, `DELETE /api/investments/allocations/{id}` — return-to-destination traces.
+- `GET /api/investments/events/{id}/bank-candidates` — direction/date/account suggestions.
+- `POST /api/investments/bank-links`, `DELETE /api/investments/bank-links/{id}` — explicit bank transfer links.
+
+All monetary responses are decimal strings. This local release returns the investment workspace as one consistent snapshot; the UI paginates activity in groups of 50. Institution naming/account ownership and hosting authentication remain future work. Import earlier history before marking a partially covered project complete. Renaming a campaign or changing a provider's historical balances requires reviewing changed records rather than assuming they are duplicates.
+
+Import upload accepts multipart `mode=extend|replace` (default `extend`). Import listings/reviews return `mode`; draft replacement reviews additionally return removal counts in `replacement`. Confirmations send `expected_revision`, `acknowledge_warnings`, and, for replacement, `acknowledge_replace`. Invalid mode, malformed CSV, missing acknowledgment, and stale revision are rejected before any deletion.
+
+Tests use the dedicated `*_test` database, now also resetting investment data. `RUN_PRIVATE_SAMPLES=1` optionally validates the local investment CSV; default tests use generated synthetic CSVs. To intentionally clear *all* application data later, investment bank links and traces must be removed before bank transactions; existing bank-only DELETE sequences will be blocked by these new foreign keys. No application-data reset occurs during migrations.

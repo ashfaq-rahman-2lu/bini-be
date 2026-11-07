@@ -41,6 +41,52 @@ def parse_date(text: str):
         raise ParseError("A statement date could not be read.") from None
 
 
+def positioned_lines(page):
+    """Keep physical word positions; proportional-font text has no stable character grid."""
+    groups = pdfplumber.utils.cluster_objects(page.extract_words(), "top", 3)
+    lines = [sorted(group, key=lambda word: word["x0"]) for group in groups]
+    # Clip extraction at the detected bank footer, without modifying the PDF.
+    # This also removes wrapped footer fragments and either Web:/Website: variant.
+    footer_top = page.bbox[3]
+    for words in lines:
+        text = normalized(" ".join(word["text"] for word in words))
+        top = min(word["top"] for word in words)
+        notice = "this document is verifiable by scanning" in text
+        contact = "contact center:" in text and ("web:" in text or "website:" in text)
+        if top >= page.bbox[1] + page.height * 0.75 and (notice or contact):
+            footer_top = min(footer_top, top)
+    return [words for words in lines if min(word["top"] for word in words) < footer_top]
+
+
+def table_columns(words):
+    headers = {word["text"]: word for word in words}
+    labels = ["DESCRIPTION", "REFERENCE", "DEBITS", "CREDITS", "BALANCE"]
+    if not all(label in headers for label in labels):
+        raise ParseError("The transaction table columns could not be identified.")
+    # Amounts are right-aligned and can start to the left of their header text.
+    # The whitespace between adjacent column headings defines their separator.
+    # Continuation text can begin slightly left of the DESCRIPTION heading.
+    # Use the gap after the date column, rather than the heading's exact x0.
+    date_header = headers.get("DATE")
+    description_left = ((date_header["x1"] + headers["DESCRIPTION"]["x0"]) / 2
+                        if date_header else headers["DESCRIPTION"]["x0"] - 3)
+    columns = {"DESCRIPTION": description_left, "REFERENCE": headers["REFERENCE"]["x0"] - 1}
+    for previous, label in zip(labels[1:], labels[2:]):
+        columns[label] = (headers[previous]["x1"] + headers[label]["x0"]) / 2
+    if list(columns.values()) != sorted(columns.values()):
+        raise ParseError("The transaction table column order is unsupported.")
+    return columns
+
+
+def table_cell(words, columns, label):
+    labels = list(columns)
+    index = labels.index(label)
+    left = columns[label]
+    right = columns[labels[index + 1]] if index + 1 < len(labels) else float("inf")
+    return " ".join(word["text"] for word in words
+                    if left <= word["x0"] < right and word["text"].casefold() != "e-statement")
+
+
 def parse_pdf(data: bytes, password: str = "") -> dict:
     if len(data) > 10 * 1024 * 1024:
         raise ParseError("PDF must be at most 10 MB.")
@@ -53,15 +99,13 @@ def parse_pdf(data: bytes, password: str = "") -> dict:
         if len(reader.pages) > 50:
             raise ParseError("PDF must contain at most 50 pages.")
         page_texts = [page.extract_text(extraction_mode="layout") or "" for page in reader.pages]
-        # Coordinates provide source locations; no decrypted file is written.
+        # Physical coordinates determine cells as well as source locations.
         with pdfplumber.open(io.BytesIO(data), password=password) as document:
-            positions = []
+            pages = []
             for page in document.pages:
-                words = page.extract_words()
-                header_y = next((w["top"] for w in words if w["text"] == "TRN."), 0)
-                positions.append({
+                pages.append({
                     "width": page.width, "height": page.height,
-                    "dates": [w.copy() for w in words if re.fullmatch(r"\d{2}-[A-Za-z]{3}-\d{4}", w["text"]) and w["top"] >= header_y],
+                    "lines": positioned_lines(page),
                 })
     except ParseError:
         raise
@@ -101,19 +145,22 @@ def parse_pdf(data: bytes, password: str = "") -> dict:
         rows.append(current)
         current = None
 
-    for page_index, page_text in enumerate(page_texts):
+    for page_index, position in enumerate(pages):
         columns = None
-        position = positions[page_index]
-        for raw in page_text.splitlines():
+        for words in position["lines"]:
+            raw = " ".join(word["text"] for word in words)
             line = re.sub(r"\be-statement\b", lambda m: " " * len(m[0]), raw, flags=re.I)
             if re.match(r"^\s*Page\s+\d+\s*(?:of|/)\s*\d+\s*$", line, re.I):
                 continue
-            if "TRN. DATE" in line and all(label in line for label in ["DESCRIPTION", "REFERENCE", "DEBITS", "CREDITS", "BALANCE"]):
-                columns = {label: line.index(label) for label in ["DESCRIPTION", "REFERENCE", "DEBITS", "CREDITS", "BALANCE"]}
+            if "This document is verifiable by scanning" in line or ("Contact Center:" in line and ("Website:" in line or "Web:" in line)):
                 continue
-            if "STATEMENT CLOSING BALANCE" in line:
+            if "TRN. DATE" in line and all(label in line for label in ["DESCRIPTION", "REFERENCE", "DEBITS", "CREDITS", "BALANCE"]):
+                columns = table_columns(words)
+                continue
+            closing_label = re.search(r"STATEMENT\s*CLOSING\s*BALANCE", line)
+            if closing_label:
                 finish()
-                closing = money(line.split("STATEMENT CLOSING BALANCE", 1)[1])
+                closing = money(line[closing_label.end():])
                 table_finished = True
             for label, key, count_key, marker in [("DEBITS", "debit_total", "debit_count", "DR"), ("CREDITS", "credit_total", "credit_count", "CR")]:
                 match = re.match(rf"^\s*{label}\s+([\d,.-]+)\s+#(?:{marker})COUNT:\s*(\d+)\s*$", line)
@@ -127,20 +174,16 @@ def parse_pdf(data: bytes, password: str = "") -> dict:
                 continue
             match = DATE.match(line)
             if match:
-                top = next((w["top"] for w in position["dates"] if w["text"].lower() == match[1].lower()), 0)
-                for index, word in enumerate(position["dates"]):
-                    if word["text"].lower() == match[1].lower():
-                        position["dates"].pop(index)
-                        break
+                top = min(word["top"] for word in words)
                 if current and current["page"] == page_index + 1:
                     current["location"]["bottom"] = top
                 finish()
                 if "Opening Balance" in line:
                     if opening is None:
-                        opening = money(line[columns["BALANCE"]:])
+                        opening = money(table_cell(words, columns, "BALANCE"))
                     continue
-                debit_text = line[columns["DEBITS"]:columns["CREDITS"]].strip()
-                credit_text = line[columns["CREDITS"]:columns["BALANCE"]].strip()
+                debit_text = table_cell(words, columns, "DEBITS")
+                credit_text = table_cell(words, columns, "CREDITS")
                 debit = money(debit_text) if debit_text else Decimal("0")
                 credit = money(credit_text) if credit_text else Decimal("0")
                 if (debit > 0) == (credit > 0) or debit < 0 or credit < 0:
@@ -151,13 +194,13 @@ def parse_pdf(data: bytes, password: str = "") -> dict:
                     "posting_date": parse_date(match[1]).isoformat(),
                     "direction": "debit" if debit > 0 else "credit",
                     "amount": str(debit or credit),
-                    "balance": str(money(line[columns["BALANCE"]:])),
+                    "balance": str(money(table_cell(words, columns, "BALANCE"))),
                     "description_parts": [], "references": [], "raw_lines": [],
                 }
             if current and line.strip():
                 # Continuation text belongs to this row until the next date.
-                current["description_parts"].append(" ".join(line[columns["DESCRIPTION"]:columns["REFERENCE"]].split()))
-                reference = line[columns["REFERENCE"]:columns["DEBITS"]].strip()
+                current["description_parts"].append(table_cell(words, columns, "DESCRIPTION"))
+                reference = table_cell(words, columns, "REFERENCE")
                 if reference:
                     current["references"].append(reference)
                 current["raw_lines"].append(raw)

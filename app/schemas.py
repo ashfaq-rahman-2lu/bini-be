@@ -1,4 +1,4 @@
-from datetime import date
+from datetime import date, datetime
 from decimal import Decimal
 from typing import Literal
 from uuid import UUID
@@ -10,6 +10,13 @@ class AccountView(BaseModel):
     id: UUID
     label: str
     currency: str
+
+
+class ImportSummary(BaseModel):
+    id: UUID
+    filename: str
+    status: Literal["draft", "confirmed"]
+    created_at: datetime
 
 
 class TransactionView(BaseModel):

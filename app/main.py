@@ -7,6 +7,7 @@ import uuid
 from datetime import date
 from pathlib import Path
 from typing import Annotated, Literal
+from urllib.parse import quote
 
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
@@ -19,9 +20,11 @@ from .config import settings
 from .db import get_db
 from .matching import FIELDS, review, transaction_view
 from .models import Account, SourceLink, Statement, StatementRow, Transaction
-from .schemas import AccountView, Confirmation, Decisions, ImportView, TransactionList
+from .schemas import AccountView, Confirmation, Decisions, ImportSummary, ImportView, TransactionList
+from .investments import router as investment_router
 
 app = FastAPI(title="Bini · Bank statement ledger", version="0.1.0")
+app.include_router(investment_router)
 app.add_middleware(CORSMiddleware, allow_origins=settings.allowed_origins,
                    allow_methods=["GET", "POST", "PATCH", "DELETE"], allow_headers=["Content-Type"])
 DB = Annotated[Session, Depends(get_db)]
@@ -46,8 +49,8 @@ def statement_or_404(db, statement_id, lock=False):
     return statement
 
 
-def process_pdf(data, password):
-    payload = json.dumps({"pdf": base64.b64encode(data).decode(), "password": password})
+def process_pdf(data, password, operation="extract"):
+    payload = json.dumps({"pdf": base64.b64encode(data).decode(), "password": password, "operation": operation})
     try:
         result = subprocess.run([sys.executable, "-m", "app.parser_worker"], input=payload,
             capture_output=True, text=True, timeout=60, cwd=Path(__file__).resolve().parents[1])
@@ -62,6 +65,26 @@ def process_pdf(data, password):
     if "error" in output:
         raise HTTPException(422, output["error"])
     return output["result"]
+
+
+@app.post("/api/pdfs/unlock", response_class=Response)
+def unlock(file: UploadFile = File(...), password: str = Form("")):
+    data = file.file.read(10 * 1024 * 1024 + 1)
+    if len(data) > 10 * 1024 * 1024:
+        raise HTTPException(413, "PDF must be at most 10 MB.")
+    output = base64.b64decode(process_pdf(data, password, operation="unlock"), validate=True)
+    filename = Path((file.filename or "document.pdf").replace("\\", "/")).stem[:150] + "_unlocked.pdf"
+    return Response(output, media_type="application/pdf", headers={
+        "Content-Disposition": "attachment; filename=\"unlocked.pdf\"; filename*=UTF-8''" + quote(filename, safe=""),
+        "Cache-Control": "no-store", "X-Content-Type-Options": "nosniff",
+    })
+
+
+@app.get("/api/imports", response_model=list[ImportSummary])
+def list_imports(db: DB, limit: int = Query(50, ge=1, le=100)):
+    return [dict(row._mapping) for row in db.execute(select(
+        Statement.id, Statement.filename, Statement.status, Statement.created_at,
+    ).order_by(Statement.created_at.desc(), Statement.id.desc()).limit(limit))]
 
 
 @app.post("/api/imports", response_model=ImportView)
