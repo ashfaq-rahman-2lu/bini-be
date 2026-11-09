@@ -119,7 +119,7 @@ def test_replace_is_previewed_acknowledged_and_scoped_to_one_institution(client)
     other_events = [e for e in before['events'] if e['institution_id'] != owner['id']]
     draft = upload(client, replacement_csv(), mode='replace')
     assert draft['mode'] == 'replace' and draft['new_count'] == 2 and draft['linked_count'] == 0
-    assert draft['replacement'] == dict(events=7, projects=2, imports=2, principal_splits=1, allocations=1, bank_links=1)
+    assert draft['replacement'] == dict(events=7, projects=2, imports=2, principal_splits=1, allocations=1, bank_links=1, reconciliation_cases=0, reinvestment_associations=0)
     assert workspace(client) == before
     denied = client.post(f'/api/investments/imports/{draft["id"]}/confirm', json={'expected_revision': draft['revision'], 'acknowledge_warnings': True})
     assert denied.status_code == 422 and 'Acknowledge replacement' in denied.json()['detail']

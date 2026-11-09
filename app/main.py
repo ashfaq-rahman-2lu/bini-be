@@ -21,10 +21,12 @@ from .db import get_db
 from .matching import FIELDS, review, transaction_view
 from .models import Account, SourceLink, Statement, StatementRow, Transaction
 from .schemas import AccountView, Confirmation, Decisions, ImportSummary, ImportView, TransactionList
-from .investments import router as investment_router
+from .investments import router as investment_router, lock as investment_lock
+from .reconciliation_api import router as reconciliation_router
 
 app = FastAPI(title="Bini · Bank statement ledger", version="0.1.0")
 app.include_router(investment_router)
+app.include_router(reconciliation_router)
 app.add_middleware(CORSMiddleware, allow_origins=settings.allowed_origins,
                    allow_methods=["GET", "POST", "PATCH", "DELETE"], allow_headers=["Content-Type"])
 DB = Annotated[Session, Depends(get_db)]
@@ -157,6 +159,9 @@ def decisions(statement_id: uuid.UUID, body: Decisions, db: DB):
 
 @app.post("/api/imports/{statement_id}/confirm", response_model=ImportView)
 def confirm(statement_id: uuid.UUID, body: Confirmation, db: DB):
+    # A new bank occurrence can change uniqueness in an investment review.
+    # Take the shared lock first, before the existing account/statement locks.
+    investment_lock(db)
     statement = statement_or_404(db, statement_id, lock=True)
     if statement.status == "confirmed":
         return review(db, statement)
