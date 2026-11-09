@@ -194,7 +194,7 @@ def test_bank_competition_and_concurrent_runs(client):
     confirm(client, upload(client, competing_csv(True)))
     confirm(client, upload(client, competing_csv(True), name='Second'))
     def work(_):
-        with TestClient(app) as c: return run(c)
+        with TestClient(app, headers=client.headers, cookies=client.cookies) as c: return run(c)
     with ThreadPoolExecutor(max_workers=2) as pool: results = list(pool.map(work, range(2)))
     assert sum(r['saved']['allocations'] for r in results) == 4
     assert sum(r['saved']['bank_links'] for r in results) == 0

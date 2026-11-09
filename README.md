@@ -7,7 +7,7 @@ FastAPI + PostgreSQL backend for EBL bank statement imports, financial reconcili
 - Python 3.12+
 - Docker with Compose
 
-The frontend, API, and database bind to loopback addresses. This release has no authentication and is intended for local use. Public deployment belongs to the later authentication milestone.
+Local development binds the frontend, API, and database to loopback addresses. The API requires the single account configured with `AUTH_USERNAME`, `AUTH_PASSWORD`, and `AUTH_SECRET`; see authentication setup below.
 
 ## Start locally
 
@@ -18,6 +18,7 @@ docker compose -f infrastructure/compose.yaml up -d --wait
 python3 -m venv .venv
 .venv/bin/python -m pip install -r requirements.lock.txt
 cp .env.example .env
+# Edit .env: set AUTH_USERNAME, AUTH_PASSWORD and AUTH_SECRET before starting.
 .venv/bin/alembic upgrade head
 .venv/bin/python -m uvicorn app.main:app --host 127.0.0.1 --port 8000
 ```
@@ -94,7 +95,7 @@ Restore into a separate, empty database with `pg_restore`; validate before switc
 - `tests/`: synthetic financial/import/concurrency tests and optional private-sample checks.
 - `infrastructure/compose.yaml`: dedicated local PostgreSQL service and persistent volume.
 
-Deferred: authentication/registration, public hosting, Excel export, categories, notes, inline extraction editing, PDF viewer, OCR, and other banks. GraphQL is not required for the REST workflow.
+Deferred: registration/multiple users, Excel export, categories, notes, inline extraction editing, PDF viewer, OCR, and other banks. GraphQL is not required for the REST workflow.
 
 The backend `.gitignore` independently excludes Python environments, caches, local environment files, private PDFs/password files, uploads, data, and backups, including infrastructure-local files. Commit source, migrations, requirements/lockfiles, tests, `.env.example`, and `infrastructure/compose.yaml`. Keep real statements and secrets outside version control.
 
@@ -144,7 +145,7 @@ REST endpoints:
 - `GET /api/investments/events/{id}/bank-candidates` — direction/date/account suggestions.
 - `POST /api/investments/bank-links`, `DELETE /api/investments/bank-links/{id}` — explicit bank transfer links.
 
-All monetary responses are decimal strings. This local release returns the investment workspace as one consistent snapshot; the UI paginates activity in groups of 50. Institution naming/account ownership and hosting authentication remain future work. Import earlier history before marking a partially covered project complete. Renaming a campaign or changing a provider's historical balances requires reviewing changed records rather than assuming they are duplicates.
+All monetary responses are decimal strings. This release returns the investment workspace as one consistent snapshot; the UI paginates activity in groups of 50. Institution naming and per-user account ownership remain future work: the configured single account accesses the whole workspace. Import earlier history before marking a partially covered project complete. Renaming a campaign or changing a provider's historical balances requires reviewing changed records rather than assuming they are duplicates.
 
 Import upload accepts multipart `mode=extend|replace` (default `extend`). Import listings/reviews return `mode`; draft replacement reviews additionally return removal counts in `replacement`. Confirmations send `expected_revision`, `acknowledge_warnings`, and, for replacement, `acknowledge_replace`. Invalid mode, malformed CSV, missing acknowledgment, and stale revision are rejected before any deletion.
 
@@ -186,3 +187,26 @@ Project updates accept `confirm_wallet_empty: true` with closed status and compl
 Wallet source reviews can explicitly accept an absolute difference up to **BDT 5.00**. The server calculates `selected source credits − recorded payment`, validates whole-credit capacities, and stores the signed decimal-string difference, source selection, explanation, timestamp and original evidence in the existing reconciliation resolution history. No migration is needed. No differences are accepted automatically; CSV validation and bank matching remain exact.
 
 Source allocations retain their full credit amounts. For these settlements they represent gross source contributions, not exact net shares. The difference belongs to the settlement pool rather than an arbitrary business. It is excluded from spendable wallet attribution, retained separately from the provider's original Ready Balance, and exposed in reconciliation, event and project-trail responses. A shortfall that leaves other credits without verified backing blocks dependent wallet spending. Related bank shares remain unassigned where the difference prevents exact attribution. Original investment, return, profit and bank amounts remain unchanged. Removing/changing source connections invalidates the accepted difference until reviewed again. Extend preserves the evidence; replace clears it with the institution's existing reconciliation history.
+
+## Single-account authentication
+
+Set these only in the backend `.env` locally, or in Render's environment settings:
+
+```dotenv
+AUTH_USERNAME=admin
+AUTH_PASSWORD=<your-long-unique-password>
+AUTH_SECRET=<random-signing-secret-at-least-32-characters>
+AUTH_COOKIE_SECURE=true
+```
+
+Use your password manager to generate and save a strong password and a separate random signing secret (for example, `python3 -c 'import secrets; print(secrets.token_urlsafe(48))'`). The placeholders above are not working credentials. Missing credentials or a signing secret shorter than 32 characters cause login and protected routes to return 503; there is no default password or authentication bypass. Restart the backend after changing configuration. Never commit `.env` or put these values into frontend variables.
+
+`POST /api/auth/login` accepts JSON `username` and `password`, sets an eight-hour signed `bini_session` cookie, and returns only the username. The browser sends the cookie automatically; JavaScript cannot read it (`HttpOnly`). It uses `SameSite=Lax`, path `/api`, and `Secure` by default. Set `AUTH_COOKIE_SECURE=false` only for local HTTP development, as shown in `.env.example`. Keep it `true` on Render.
+
+All financial and PDF routes require the cookie. `GET /api/auth/session` restores the frontend session after refresh; `POST /api/auth/logout` deletes the cookie. Every POST/PATCH/DELETE request, including login/logout, must include `X-Bini-Request: 1`. If an Origin header is present, it must be in `ALLOWED_ORIGINS`; credentialed CORS preflights also enforce that list. The frontend supplies this protection header automatically. API responses use `Cache-Control: no-store`. `/api/health` remains public. `/docs` and `/openapi.json` expose descriptions, not financial records; command-line API clients need a cookie jar and the protection header.
+
+Changing the username, password, or signing secret invalidates existing sessions. Keep the secret consistent across workers/instances. Sessions are stateless: sign-out deletes this browser's cookie and clears the frontend cache; a separately copied cookie remains valid until expiry or credential/secret rotation. Ten failed logins within one minute temporarily block further attempts in that process. The limiter resets on restart and is independent per worker.
+
+No authentication tables, database migrations, or Supabase Auth configuration are needed. All signed-in requests access the same workspace. For Netlify + Render, use the frontend's `/api` proxy setup in its README so the cookie works on the provider's default domains. Set `ALLOWED_ORIGINS` to the exact HTTPS frontend origin, for example `["https://your-site.netlify.app"]`. Direct requests from `netlify.app` to `onrender.com` are cross-site and will not carry this Lax cookie. Same-site HTTPS custom domains are an alternative. Keep the unused Supabase Data API disabled for the existing deployment plan.
+
+The pytest fixtures use separate synthetic credentials and cookie-authenticated clients. Authentication tests run without a database and cover cookie flags, logout, expiry/tampering, credential rotation, fail-closed configuration, every data route, CSRF/CORS, public health checks, and login throttling.

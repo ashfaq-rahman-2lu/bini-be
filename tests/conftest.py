@@ -15,6 +15,11 @@ from sqlalchemy.engine import make_url
 if not (make_url(TEST_URL).database or "").endswith("_test"):
     raise RuntimeError("Tests require a separate database whose name ends with _test.")
 os.environ["DATABASE_URL"] = TEST_URL
+os.environ["AUTH_USERNAME"] = "test-user"
+os.environ["AUTH_PASSWORD"] = "test-only-login-password"
+os.environ["AUTH_SECRET"] = "test-only-signing-secret-at-least-32-characters"
+
+os.environ["AUTH_COOKIE_SECURE"] = "false"
 
 from fastapi.testclient import TestClient
 from sqlalchemy import text
@@ -23,14 +28,18 @@ from app.main import app
 
 
 @pytest.fixture(autouse=True)
-def empty_ledger():
+def empty_ledger(request):
+    if request.module.__name__ == "test_auth":
+        return  # Authentication tests deliberately need no database connection.
     with engine.begin() as connection:
         connection.execute(text("TRUNCATE investment_institutions, source_links, statement_rows, transactions, statements, accounts CASCADE"))
 
 
 @pytest.fixture
 def client():
-    with TestClient(app) as instance:
+    with TestClient(app, headers={"X-Bini-Request": "1"}) as instance:
+        result = instance.post("/api/auth/login", json={"username": "test-user", "password": "test-only-login-password"})
+        assert result.status_code == 200, result.text
         yield instance
 
 
