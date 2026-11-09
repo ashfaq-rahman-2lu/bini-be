@@ -237,6 +237,36 @@ The repository-root `Dockerfile` pins Python 3.12, installs `requirements.lock.t
 
 Migrations create/update the schema; they do not copy your existing local records to Supabase. Back up and migrate existing data separately before switching production traffic. No persistent Railway volume is needed: uploaded source documents are stored in PostgreSQL.
 
-Startup migrations are intended for this single-replica personal deployment. Before scaling to multiple replicas, move `python -m alembic upgrade head` to Railway's Pre-Deploy Command and override Start Command with `sh -c 'exec python -m uvicorn app.main:app --host 0.0.0.0 --port "$PORT"'` so replicas do not run migrations concurrently.
+Startup migrations are intended for this single-replica personal deployment. Before scaling to multiple replicas, move `python -m alembic upgrade head` to Railway's Pre-Deploy Command and override Start Command with `sh -c 'exec python -m uvicorn app.main:app --host 0.0.0.0 --port "$PORT" --no-access-log'` so replicas do not run migrations concurrently.
 
 Reference: [Railway Dockerfiles](https://docs.railway.com/builds/dockerfiles), [pre-deploy commands](https://docs.railway.com/deployments/pre-deploy-command), and [Serverless](https://docs.railway.com/deployments/serverless).
+
+### Confirmation latency
+
+Bank statement confirmation retains its loaded source rows and inserts new transactions in a batch, avoiding a database reload and flush for every source occurrence. Revision checks, duplicate decisions, lock ordering, source links, and all writes remain in one database transaction. Failures roll back the entire confirmation; repeating a completed confirmation does not add transactions again. No schema migration is needed for this optimization.
+
+Place Railway and Supabase in nearby regions to reduce database round-trip time. Serverless cold starts can add latency to the first request after inactivity. Netlify's API proxy has a 26-second timeout, including time spent waiting for the backend; a 504 does not establish whether a confirmation committed. Refresh the import status before retrying. For consistently longer operations, use asynchronous jobs with status polling, or the same-site HTTPS custom-domain setup documented in the frontend README to call Railway directly without Netlify's API proxy.
+
+## Request timing logs and Better Stack
+
+Every HTTP call emits one structured JSON completion event to stdout, including handled 4xx/5xx failures, unhandled exceptions, health requests, and CORS preflights. `request.duration_ms` measures elapsed server time through completion of the response body/application call. `request.response_started_ms` measures time until response headers start. These timings do not include container startup before the request enters the application, browser-to-Netlify transit, or Netlify's queue/proxy time. An operation that continues after a Netlify timeout can log its final server result later; that event does not prove the browser received the result.
+
+Events include UTC timestamp, level, service, `LOG_ENVIRONMENT`, method, matched route template, status, duration, outcome, disconnect flag, and a generated `request.id`. Route templates omit actual record IDs, and unmatched paths/preflights use `unmatched`. Normal and handled-error responses include the same generated ID in `X-Request-ID`. Unhandled failures are logged with their exception class only; cancellation before response headers is recorded as status 499, which is a diagnostic marker rather than a status necessarily sent to the browser.
+
+Timing events exclude URLs/query strings, request/response bodies, headers, cookies, usernames, IP addresses, database parameters, financial values, and exception messages/tracebacks. The Docker start command disables Uvicorn's separate access log so query strings are not duplicated there. When starting Uvicorn manually, also use `--no-access-log` if you want this behavior. Uvicorn's separate diagnostic/error output is not forwarded by this integration.
+
+To enable direct delivery, create a **Python** log source in Better Stack, then set these variables on the Railway backend service and deploy:
+
+```dotenv
+LOG_ENVIRONMENT=production
+BETTERSTACK_SOURCE_TOKEN=<source-token-from-Better-Stack>
+BETTERSTACK_INGESTION_URL=https://<ingesting-host-from-the-same-source>
+```
+
+Copy the full HTTPS ingestion origin from that source, with no path, credentials, or query string. Use the source token, not a management API token. The fields default to blank for stdout-only logging; incomplete or invalid configuration keeps logging locally and writes a configuration warning. Keep the token in Railway variables, never Git or frontend configuration. No logging source, credentials, or external account setup is created automatically by the application.
+
+Only the dedicated timing logger is sent to Better Stack using its official `logtail-python` client. Batches flush in a background thread, with a bounded queue of 1,000 events, one-second flush interval, and network timeouts. A full queue drops extra remote events rather than blocking API calls; stdout still receives the events. Shipping failures do not change API results. Graceful process exit allows a bounded flush; abrupt termination or prolonged network failure can lose buffered remote events. These are operational logs, not an audit ledger.
+
+In Better Stack Live tail, inspect the structured `request` fields. Filter or chart `request.duration_ms` by `request.route` and `request.status_code`; use p50/p95 timings, error counts, and `request.id` to investigate slow confirmations without logging financial payloads. The same fields are present in Railway's JSON stdout logs even before a Better Stack source is configured.
+
+Reference: [Better Stack Python setup and handler options](https://betterstack.com/docs/logs/python/).

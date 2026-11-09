@@ -14,8 +14,10 @@ httpx==0.28.1
 idna==3.20
 iniconfig==2.3.1
 itsdangerous==2.2.0
+logtail-python==0.5.5
 Mako==1.4.3
 MarkupSafe==3.0.4
+msgpack==1.2.4
 opentelemetry-api==1.45.2
 packaging==26.3
 pdfminer.six==20260107
@@ -35,8 +37,10 @@ pytest==9.2.0
 python-dotenv==1.2.4
 python-multipart==0.0.33
 reportlab==4.5.1
+requests==2.34.2
 SQLAlchemy==2.0.55
 starlette==1.10.0
 typing-inspection==0.4.4
 typing_extensions==4.16.0
+urllib3==2.8.0
 uvicorn==0.54.0

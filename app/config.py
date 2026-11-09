@@ -14,6 +14,9 @@ class Settings(BaseSettings):
     auth_username: str = "admin"
     auth_password: SecretStr = SecretStr("")
     auth_secret: SecretStr = SecretStr("")
+    log_environment: str = "development"
+    betterstack_source_token: SecretStr = SecretStr("")
+    betterstack_ingestion_url: str = ""
 
 
 settings = Settings()

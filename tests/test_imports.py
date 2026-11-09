@@ -5,9 +5,9 @@ import subprocess
 
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import func, select
+from sqlalchemy import event, func, select
 
-from app.db import SessionLocal
+from app.db import SessionLocal, engine
 from app.main import app
 from app.models import Account, SourceLink, Statement, StatementRow, Transaction
 from app.parser import ParseError, parse_pdf
@@ -48,6 +48,54 @@ def test_reupload_and_repeated_confirmation(client, pdf_factory):
     assert client.get("/api/transactions").json()["total"] == 2
     with SessionLocal() as db:
         assert db.scalar(select(func.count()).select_from(SourceLink)) == 2
+
+
+@pytest.mark.parametrize("row_count", [2, 25])
+def test_confirmation_batches_database_round_trips(client, pdf_factory, row_count):
+    entries = [("02-Dec-2025", "credit", "1.00", f"Synthetic payment {i}", f"REF-{i}")
+               for i in range(row_count)]
+    draft = upload(client, pdf_factory(entries=entries)).json()
+    assert len(draft["rows"]) == row_count
+    queries = []
+
+    def record(connection, cursor, statement, parameters, context, executemany):
+        queries.append(statement)
+
+    event.listen(engine, "before_cursor_execute", record)
+    try:
+        response = confirm(client, draft)
+    finally:
+        event.remove(engine, "before_cursor_execute", record)
+    assert response.status_code == 200, response.text
+    assert response.json()["status"] == "confirmed"
+    assert len(queries) <= 18, f"Confirmation issued {len(queries)} DB calls for {row_count} rows"
+    with SessionLocal() as db:
+        assert db.scalar(select(func.count()).select_from(Transaction)) == row_count
+        assert db.scalar(select(func.count()).select_from(SourceLink)) == row_count
+
+
+def test_batched_confirmation_rolls_back_when_source_links_fail(client, pdf_factory):
+    draft = upload(client, pdf_factory()).json()
+
+    def fail_links(connection, cursor, statement, parameters, context, executemany):
+        if statement.lstrip().startswith("INSERT INTO source_links"):
+            raise RuntimeError("Synthetic source-link write failure")
+
+    event.listen(engine, "before_cursor_execute", fail_links)
+    try:
+        with TestClient(app, headers=client.headers, cookies=client.cookies,
+                        raise_server_exceptions=False) as failing:
+            assert confirm(failing, draft).status_code == 500
+    finally:
+        event.remove(engine, "before_cursor_execute", fail_links)
+    with SessionLocal() as db:
+        assert db.scalar(select(func.count()).select_from(Transaction)) == 0
+        assert db.scalar(select(func.count()).select_from(SourceLink)) == 0
+        statement = db.get(Statement, draft["id"])
+        assert statement.status == "draft"
+        assert db.get(Account, statement.account_id).revision == 0
+        assert all(row.decision is None and row.match_id is None for row in db.scalars(select(StatementRow)))
+    assert confirm(client, draft).status_code == 200
 
 
 def test_cancel_draft_and_protect_confirmed(client, pdf_factory):

@@ -17,4 +17,4 @@ USER 10001:10001
 EXPOSE 8000
 
 # Single-instance deployment: migrations must succeed before accepting requests.
-CMD ["sh", "-c", "python -m alembic upgrade head && exec python -m uvicorn app.main:app --host 0.0.0.0 --port \"${PORT:-8000}\""]
+CMD ["sh", "-c", "python -m alembic upgrade head && exec python -m uvicorn app.main:app --host 0.0.0.0 --port \"${PORT:-8000}\" --no-access-log"]
