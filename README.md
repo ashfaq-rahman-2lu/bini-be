@@ -190,7 +190,7 @@ Source allocations retain their full credit amounts. For these settlements they 
 
 ## Single-account authentication
 
-Set these only in the backend `.env` locally, or in Render's environment settings:
+Set these only in the backend `.env` locally, or in Railway's service variables:
 
 ```dotenv
 AUTH_USERNAME=admin
@@ -201,12 +201,42 @@ AUTH_COOKIE_SECURE=true
 
 Use your password manager to generate and save a strong password and a separate random signing secret (for example, `python3 -c 'import secrets; print(secrets.token_urlsafe(48))'`). The placeholders above are not working credentials. Missing credentials or a signing secret shorter than 32 characters cause login and protected routes to return 503; there is no default password or authentication bypass. Restart the backend after changing configuration. Never commit `.env` or put these values into frontend variables.
 
-`POST /api/auth/login` accepts JSON `username` and `password`, sets an eight-hour signed `bini_session` cookie, and returns only the username. The browser sends the cookie automatically; JavaScript cannot read it (`HttpOnly`). It uses `SameSite=Lax`, path `/api`, and `Secure` by default. Set `AUTH_COOKIE_SECURE=false` only for local HTTP development, as shown in `.env.example`. Keep it `true` on Render.
+`POST /api/auth/login` accepts JSON `username` and `password`, sets an eight-hour signed `bini_session` cookie, and returns only the username. The browser sends the cookie automatically; JavaScript cannot read it (`HttpOnly`). It uses `SameSite=Lax`, path `/api`, and `Secure` by default. Set `AUTH_COOKIE_SECURE=false` only for local HTTP development, as shown in `.env.example`. Keep it `true` on Railway.
 
 All financial and PDF routes require the cookie. `GET /api/auth/session` restores the frontend session after refresh; `POST /api/auth/logout` deletes the cookie. Every POST/PATCH/DELETE request, including login/logout, must include `X-Bini-Request: 1`. If an Origin header is present, it must be in `ALLOWED_ORIGINS`; credentialed CORS preflights also enforce that list. The frontend supplies this protection header automatically. API responses use `Cache-Control: no-store`. `/api/health` remains public. `/docs` and `/openapi.json` expose descriptions, not financial records; command-line API clients need a cookie jar and the protection header.
 
 Changing the username, password, or signing secret invalidates existing sessions. Keep the secret consistent across workers/instances. Sessions are stateless: sign-out deletes this browser's cookie and clears the frontend cache; a separately copied cookie remains valid until expiry or credential/secret rotation. Ten failed logins within one minute temporarily block further attempts in that process. The limiter resets on restart and is independent per worker.
 
-No authentication tables, database migrations, or Supabase Auth configuration are needed. All signed-in requests access the same workspace. For Netlify + Render, use the frontend's `/api` proxy setup in its README so the cookie works on the provider's default domains. Set `ALLOWED_ORIGINS` to the exact HTTPS frontend origin, for example `["https://your-site.netlify.app"]`. Direct requests from `netlify.app` to `onrender.com` are cross-site and will not carry this Lax cookie. Same-site HTTPS custom domains are an alternative. Keep the unused Supabase Data API disabled for the existing deployment plan.
+No authentication tables, database migrations, or Supabase Auth configuration are needed. All signed-in requests access the same workspace. For Netlify + Railway, use the frontend's `/api` proxy setup in its README so the cookie works on the provider's default domains. Set `ALLOWED_ORIGINS` to the exact HTTPS frontend origin, for example `["https://your-site.netlify.app"]`. Direct requests from `netlify.app` to `up.railway.app` are cross-site and will not carry this Lax cookie. Same-site HTTPS custom domains are an alternative. Keep the unused Supabase Data API disabled for the existing deployment plan.
 
 The pytest fixtures use separate synthetic credentials and cookie-authenticated clients. Authentication tests run without a database and cover cookie flags, logout, expiry/tampering, credential rotation, fail-closed configuration, every data route, CSRF/CORS, public health checks, and login throttling.
+
+
+## Deploy the backend on Railway
+
+The repository-root `Dockerfile` pins Python 3.12, installs `requirements.lock.txt`, and includes only application code and Alembic migrations. `.dockerignore` keeps local secrets, private statements, virtual environments, tests, and backups out of the build context. The container runs as an unprivileged user.
+
+1. Commit and push this backend repository, including the authentication changes. In Railway, create a service from `bini-be` and select the branch containing these files. Leave Root Directory empty for the separate backend repository; if deploying the parent workspace, use `/backend`.
+2. Use the included Dockerfile. Leave custom build and start commands unset so Railway uses the image command. Do not add a Railway PostgreSQL service: this application uses the existing Supabase database.
+3. Set these Railway service variables privately before starting the service:
+
+   ```dotenv
+   DATABASE_URL=postgresql+psycopg://postgres.PROJECT_REF:ENCODED_PASSWORD@SESSION_POOLER_HOST:5432/postgres?sslmode=require
+   AUTH_USERNAME=<your-login-name>
+   AUTH_PASSWORD=<your-long-unique-login-password>
+   AUTH_SECRET=<random-signing-secret-at-least-32-characters>
+   AUTH_COOKIE_SECURE=true
+   ALLOWED_ORIGINS=["https://your-site.netlify.app"]
+   ```
+
+   Copy the exact session-pooler host and username from Supabase's Connect dialog, replace the database password, and percent-encode reserved password characters. The Supabase database password is separate from the application's `AUTH_PASSWORD`. Local `.env` values are not uploaded or included in the image. Keep the unused Supabase Data API disabled.
+4. Use one replica, set Healthcheck Path to `/api/health`, and enable Serverless in the deployment settings for infrequent use. Expect a cold start after sleeping. Sleeping reduces compute usage but does not waive any plan minimum or other charges. Avoid uptime pings if you want the service to sleep.
+5. Deploy and generate a public domain under the service's networking settings. The image runs `python -m alembic upgrade head` before starting Uvicorn on `0.0.0.0:$PORT` (8000 when PORT is absent). Migrations failing prevent startup. Health returns `{"status":"ok"}` after connecting to PostgreSQL.
+6. Set Netlify's build variable `BACKEND_URL=https://your-backend.up.railway.app`, with no `/api`, and rebuild the frontend. Its existing build script uses `/api` and generates the proxy needed for cookie sessions. Match `ALLOWED_ORIGINS` to the final frontend origin exactly. See the frontend README for the proxy timeout and same-site custom-domain alternative.
+7. Check login, refresh persistence, a synthetic import, and logout. An unauthenticated request to `/api/transactions` should return 401. Health remains public.
+
+Migrations create/update the schema; they do not copy your existing local records to Supabase. Back up and migrate existing data separately before switching production traffic. No persistent Railway volume is needed: uploaded source documents are stored in PostgreSQL.
+
+Startup migrations are intended for this single-replica personal deployment. Before scaling to multiple replicas, move `python -m alembic upgrade head` to Railway's Pre-Deploy Command and override Start Command with `sh -c 'exec python -m uvicorn app.main:app --host 0.0.0.0 --port "$PORT"'` so replicas do not run migrations concurrently.
+
+Reference: [Railway Dockerfiles](https://docs.railway.com/builds/dockerfiles), [pre-deploy commands](https://docs.railway.com/deployments/pre-deploy-command), and [Serverless](https://docs.railway.com/deployments/serverless).

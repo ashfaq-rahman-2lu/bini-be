@@ -1,0 +1,15 @@
+# Only application code, migrations, and locked dependencies enter the context.
+**
+!Dockerfile
+!requirements.lock.txt
+!alembic.ini
+!app/
+!app/**
+!migrations/
+!migrations/**
+
+# Exclude generated Python files even inside the allowed source directories.
+**/__pycache__/
+**/*.py[cod]
+**/.env
+**/.env.*
