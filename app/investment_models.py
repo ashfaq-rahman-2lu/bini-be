@@ -82,6 +82,9 @@ class ReturnAllocation(Base):
     source_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("investment_events.id"), index=True)
     target_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("investment_events.id"), index=True)
     amount: Mapped[Decimal] = mapped_column(Numeric(18, 2))
+    provenance: Mapped[str] = mapped_column(String(12), default='manual', server_default='manual')
+    explanation: Mapped[str] = mapped_column(Text, default='', server_default='')
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
 class InvestmentBankLink(Base):
@@ -91,3 +94,33 @@ class InvestmentBankLink(Base):
     event_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("investment_events.id"), index=True)
     transaction_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("transactions.id"), index=True)
     amount: Mapped[Decimal] = mapped_column(Numeric(18, 2))
+    provenance: Mapped[str] = mapped_column(String(12), default='manual', server_default='manual')
+    explanation: Mapped[str] = mapped_column(Text, default='', server_default='')
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class ReinvestmentAssociation(Base):
+    __tablename__ = 'investment_reinvestment_associations'
+    __table_args__ = (UniqueConstraint('event_id'), CheckConstraint('funding_id <> event_id'))
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    funding_id: Mapped[uuid.UUID] = mapped_column(ForeignKey('investment_events.id'), index=True)
+    event_id: Mapped[uuid.UUID] = mapped_column(ForeignKey('investment_events.id'))
+    provenance: Mapped[str] = mapped_column(String(12), default='manual', server_default='manual')
+    explanation: Mapped[str] = mapped_column(Text, default='', server_default='')
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class ReconciliationCase(Base):
+    __tablename__ = 'investment_reconciliation_cases'
+    __table_args__ = (UniqueConstraint('institution_id', 'key'),)
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    institution_id: Mapped[uuid.UUID] = mapped_column(ForeignKey('investment_institutions.id'), index=True)
+    key: Mapped[str] = mapped_column(String(100))
+    event_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey('investment_events.id'))
+    kind: Mapped[str] = mapped_column(String(40))
+    status: Mapped[str] = mapped_column(String(12), default='open')
+    details: Mapped[dict] = mapped_column(JSONB)
+    # Append-only review history retains the original evidence and user explanation.
+    resolutions: Mapped[list] = mapped_column(JSONB, default=list)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))

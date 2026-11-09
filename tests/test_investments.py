@@ -119,7 +119,7 @@ def test_replace_is_previewed_acknowledged_and_scoped_to_one_institution(client)
     other_events = [e for e in before['events'] if e['institution_id'] != owner['id']]
     draft = upload(client, replacement_csv(), mode='replace')
     assert draft['mode'] == 'replace' and draft['new_count'] == 2 and draft['linked_count'] == 0
-    assert draft['replacement'] == dict(events=7, projects=2, imports=2, principal_splits=1, allocations=1, bank_links=1)
+    assert draft['replacement'] == dict(events=7, projects=2, imports=2, principal_splits=1, allocations=1, bank_links=1, reconciliation_cases=0, reinvestment_associations=0)
     assert workspace(client) == before
     denied = client.post(f'/api/investments/imports/{draft["id"]}/confirm', json={'expected_revision': draft['revision'], 'acknowledge_warnings': True})
     assert denied.status_code == 422 and 'Acknowledge replacement' in denied.json()['detail']
@@ -201,7 +201,7 @@ def test_replacement_rolls_back_removed_data_if_later_work_fails(client, monkeyp
     def fail_preview(*args): raise RuntimeError('Synthetic failure after rebuilding the ledger')
     with monkeypatch.context() as patch:
         patch.setattr(service, 'preview', fail_preview)
-        with TestClient(app, raise_server_exceptions=False) as failing:
+        with TestClient(app, headers=client.headers, cookies=client.cookies, raise_server_exceptions=False) as failing:
             response = failing.post(f'/api/investments/imports/{replacement["id"]}/confirm', json={'expected_revision': replacement['revision'], 'acknowledge_warnings': True, 'acknowledge_replace': True})
     assert response.status_code == 500 and workspace(client) == before
     assert client.get(f'/api/investments/imports/{replacement["id"]}').json()['status'] == 'draft'
@@ -210,7 +210,7 @@ def test_replacement_rolls_back_removed_data_if_later_work_fails(client, monkeyp
 def test_concurrent_repeated_replacement_confirmation_is_idempotent(client):
     confirm(client, upload(client)); replacement = upload(client, replacement_csv(), mode='replace')
     def commit(_):
-        with TestClient(app) as instance:
+        with TestClient(app, headers=client.headers, cookies=client.cookies) as instance:
             return instance.post(f'/api/investments/imports/{replacement["id"]}/confirm', json={'expected_revision': replacement['revision'], 'acknowledge_warnings': True, 'acknowledge_replace': True}).status_code
     with ThreadPoolExecutor(max_workers=2) as pool:
         assert list(pool.map(commit, range(2))) == [200, 200]
@@ -222,7 +222,7 @@ def test_extend_and_replace_confirmations_cannot_commit_from_the_same_stale_revi
     extended = upload(client, csv_fixture(prefix='Competing extension'))
     replacement = upload(client, replacement_csv(), mode='replace')
     def commit(draft):
-        with TestClient(app) as instance:
+        with TestClient(app, headers=client.headers, cookies=client.cookies) as instance:
             return instance.post(f'/api/investments/imports/{draft["id"]}/confirm', json={'expected_revision': draft['revision'], 'acknowledge_warnings': True, 'acknowledge_replace': True}).status_code
     with ThreadPoolExecutor(max_workers=2) as pool:
         statuses = list(pool.map(commit, [extended, replacement]))
@@ -311,7 +311,7 @@ def test_bank_matching_date_lag_partial_and_combined_links(client):
 def test_concurrent_confirmation_and_bank_capacity(client):
     bank_ids = seed_bank(); draft = upload(client)
     def commit(_):
-        with TestClient(app) as c:
+        with TestClient(app, headers=client.headers, cookies=client.cookies) as c:
             return c.post(f'/api/investments/imports/{draft["id"]}/confirm', json={'expected_revision': 0, 'acknowledge_warnings': True}).status_code
     with ThreadPoolExecutor(max_workers=2) as pool:
         assert list(pool.map(commit, range(2))) == [200, 200]
@@ -320,7 +320,7 @@ def test_concurrent_confirmation_and_bank_capacity(client):
     confirm(client, upload(client, name='Other institution'))
     events = [e for e in workspace(client)['events'] if e['kind'] == 'investment']
     def link(e):
-        with TestClient(app) as c:
+        with TestClient(app, headers=client.headers, cookies=client.cookies) as c:
             return c.post('/api/investments/bank-links', json={'event_id': e['id'], 'transaction_id': bank_ids[0], 'amount': '700'}).status_code
     with ThreadPoolExecutor(max_workers=2) as pool:
         assert sorted(pool.map(link, events)) == [200, 422]
@@ -357,7 +357,7 @@ def test_concurrent_money_traces_cannot_overspend_an_installment(client):
     source = next(e for e in data['events'] if e['kind'] == 'repayment')
     targets = [next(e for e in data['events'] if e['kind'] == 'reinvestment'), next(e for e in reversed(data['events']) if e['kind'] == 'cashout')]
     def allocate(target):
-        with TestClient(app) as c:
+        with TestClient(app, headers=client.headers, cookies=client.cookies) as c:
             return c.post('/api/investments/allocations', json={'source_id': source['id'], 'target_id': target['id'], 'amount': target['amount']}).status_code
     with ThreadPoolExecutor(max_workers=2) as pool:
         assert sorted(pool.map(allocate, targets)) == [200, 422]

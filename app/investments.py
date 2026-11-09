@@ -14,7 +14,8 @@ from sqlalchemy.orm import Session
 
 from .db import get_db
 from .investment_csv import CSVError, ZERO, parse_investment_csv
-from .investment_models import Institution, InvestmentBankLink, InvestmentEvent, InvestmentImport, InvestmentProject, InvestmentSource, ReturnAllocation
+from .investment_models import Institution, InvestmentBankLink, InvestmentEvent, InvestmentImport, InvestmentProject, InvestmentSource, ReturnAllocation, ReconciliationCase, ReinvestmentAssociation
+from .investment_reconciliation import accepted_differences, bank_evidence, ordered_events
 from .models import Account, Transaction
 
 router = APIRouter(prefix='/api/investments', tags=['investments'])
@@ -67,7 +68,9 @@ def preview(db, draft):
                            imports=count(InvestmentImport, InvestmentImport.institution_id == institution.id, InvestmentImport.id != draft.id),
                            principal_splits=count(InvestmentEvent, InvestmentEvent.institution_id == institution.id, InvestmentEvent.principal.is_not(None)),
                            allocations=count(ReturnAllocation, or_(ReturnAllocation.source_id.in_(event_ids), ReturnAllocation.target_id.in_(event_ids))),
-                           bank_links=count(InvestmentBankLink, InvestmentBankLink.event_id.in_(event_ids)))
+                           bank_links=count(InvestmentBankLink, InvestmentBankLink.event_id.in_(event_ids)),
+                           reconciliation_cases=count(ReconciliationCase, ReconciliationCase.institution_id == institution.id),
+                           reinvestment_associations=count(ReinvestmentAssociation, ReinvestmentAssociation.funding_id.in_(event_ids)))
     return dict(id=str(draft.id), institution=institution.name, filename=draft.filename, status=draft.status,
                 mode=draft.mode, replacement=replacement,
                 revision=institution.revision, rows=rows, warnings=draft.parsed['warnings'], summary=draft.parsed['summary'],
@@ -124,6 +127,8 @@ def clear_institution(db, owner_id, keep_import):
     """Called only inside the locked confirmation transaction; never delete bank rows."""
     event_ids = select(InvestmentEvent.id).where(InvestmentEvent.institution_id == owner_id)
     import_ids = select(InvestmentImport.id).where(InvestmentImport.institution_id == owner_id)
+    db.execute(delete(ReconciliationCase).where(ReconciliationCase.institution_id == owner_id))
+    db.execute(delete(ReinvestmentAssociation).where(ReinvestmentAssociation.funding_id.in_(event_ids)))
     db.execute(delete(InvestmentBankLink).where(InvestmentBankLink.event_id.in_(event_ids)))
     db.execute(delete(ReturnAllocation).where(or_(ReturnAllocation.source_id.in_(event_ids), ReturnAllocation.target_id.in_(event_ids))))
     db.execute(delete(InvestmentSource).where(or_(InvestmentSource.event_id.in_(event_ids), InvestmentSource.import_id.in_(import_ids))))
@@ -191,6 +196,7 @@ def workspace(db: DB):
     allocations = list(db.scalars(select(ReturnAllocation)))
     bank_links = list(db.execute(select(InvestmentBankLink, Transaction, Account).select_from(InvestmentBankLink)
                                .join(Transaction, Transaction.id == InvestmentBankLink.transaction_id).join(Account, Account.id == Transaction.account_id)))
+    differences = accepted_differences(events, allocations, list(db.scalars(select(ReconciliationCase))))
     by_id = {e.id: e for e in events}
     outgoing, incoming, bank = {}, {}, {}
     for allocation in allocations:
@@ -221,12 +227,23 @@ def workspace(db: DB):
                            net_recovery=cash(repaid - invested), final_gain=cash(repaid - invested) if p.status == 'closed' else None,
                            roi_percent=cash((repaid - invested) / invested * 100) if p.status == 'closed' and invested else None,
                            expected_remaining=cash(max(ZERO, p.expected_total - repaid)) if p.expected_total is not None else None,
+                           has_settlement_difference=any(str(a.target_id) in differences for a in allocations if a.source_id in row_ids),
                            traced_to_bank_payout=cash(cashout), traced_to_reinvestment=cash(reinvested),
                            untraced_returns=cash(repaid - cashout - reinvested)))
     source_rows = list(db.execute(select(InvestmentSource, InvestmentImport).join(InvestmentImport)))
+    sequences = {}
+    for source, report in sorted(source_rows, key=lambda pair: (str(pair[0].import_id), pair[0].ordinal)):
+        if report.status == 'confirmed': sequences.setdefault(report.id, []).append(source.event_id)
+    ordered = []
+    for institution in institutions:
+        own = [e for e in events if e.institution_id == institution.id]
+        ids = {e.id for e in own}
+        rows, _ = ordered_events(own, [seq for seq in sequences.values() if seq and seq[0] in ids])
+        ordered.extend(rows or own)
+    events = sorted(ordered, key=lambda e: e.posting_date)
     views = []
     for e in events:
-        views.append(dict(event_view(e), allocated_out=cash(outgoing.get(e.id, ZERO)), allocated_in=cash(incoming.get(e.id, ZERO)), bank_linked=cash(bank.get(e.id, ZERO)),
+        views.append(dict(event_view(e), difference=differences.get(str(e.id)), allocated_out=cash(outgoing.get(e.id, ZERO)), allocated_in=cash(incoming.get(e.id, ZERO)), bank_linked=cash(bank.get(e.id, ZERO)),
                           sources=[dict(import_id=str(s.import_id), filename=d.filename, ordinal=s.ordinal) for s, d in source_rows if s.event_id == e.id]))
     latest_reports = {}
     for report in db.scalars(select(InvestmentImport).where(InvestmentImport.status == 'confirmed').order_by(InvestmentImport.created_at)):
@@ -244,6 +261,7 @@ class ProjectEdit(BaseModel):
     status: Literal['active', 'closed']
     expected_total: Money | None = None
     complete_history: bool = False
+    confirm_wallet_empty: bool = False
 
 
 @router.patch('/projects/{identity}')
@@ -254,6 +272,16 @@ def edit_project(identity: uuid.UUID, body: ProjectEdit, db: DB):
         raise HTTPException(422, 'Confirm that all investment history is imported and all project payments are final before closing.')
     if body.status == 'closed' and total(db, InvestmentEvent, InvestmentEvent.amount, InvestmentEvent.project_id == project.id, InvestmentEvent.kind.in_(['investment', 'reinvestment'])) <= ZERO:
         raise HTTPException(422, 'Import this project’s investment funding before calculating its final gain or loss.')
+    if body.status == 'closed' and body.confirm_wallet_empty:
+        from .reconciliation_api import analyze
+        context = analyze(db)
+        credits = [e for e in context['events'] if e.project_id == project.id and e.kind in ('repayment', 'refund')]
+        wallet = context['wallets'][str(project.institution_id)]['credits']
+        for credit in credits:
+            used = sum((a.amount for a in context['allocations'] if a.source_id == credit.id), ZERO)
+            state = wallet.get(str(credit.id), {})
+            if used != credit.amount or Decimal(state.get('reserved', '0.00')) != ZERO or Decimal(state.get('available') or '0.00') != ZERO:
+                raise HTTPException(409, 'Wallet funds remain or their destinations are unresolved. Match cashouts or settle reinvestments in Money reconciliation before completing.')
     project.status, project.expected_total = body.status, body.expected_total
     find(db, Institution, project.institution_id).revision += 1
     db.commit()
@@ -301,13 +329,17 @@ def allocate(body: AllocationBody, db: DB):
     if body.amount + total(db, ReturnAllocation, ReturnAllocation.amount, ReturnAllocation.source_id == source.id) > source.amount or body.amount + total(db, ReturnAllocation, ReturnAllocation.amount, ReturnAllocation.target_id == target.id) > target.amount:
         raise HTTPException(422, 'The allocation exceeds the available return or the destination amount.')
     allocation = ReturnAllocation(**body.model_dump())
+    find(db, Institution, source.institution_id).revision += 1
     db.add(allocation); db.flush(); identity = str(allocation.id); db.commit()
     return {'id': identity}
 
 
 @router.delete('/allocations/{identity}', status_code=204)
 def remove_allocation(identity: uuid.UUID, db: DB):
-    lock(db); db.delete(find(db, ReturnAllocation, identity)); db.commit()
+    lock(db)
+    allocation = find(db, ReturnAllocation, identity)
+    find(db, Institution, find(db, InvestmentEvent, allocation.source_id).institution_id).revision += 1
+    db.delete(allocation); db.commit()
 
 
 @router.get('/events/{identity}/bank-candidates')
@@ -325,7 +357,8 @@ def candidates(identity: uuid.UUID, db: DB, days: int = Query(3, ge=0, le=30), a
         remaining = t.amount - total(db, InvestmentBankLink, InvestmentBankLink.amount, InvestmentBankLink.transaction_id == t.id)
         if remaining <= ZERO: continue
         matches.append(dict(id=str(t.id), account_id=str(a.id), account=a.label, posting_date=t.posting_date.isoformat(), description=t.description,
-                            amount=cash(t.amount), available=cash(remaining), exact_amount=t.amount == event.amount,
+                            amount=cash(t.amount), available=cash(remaining), exact_amount=remaining == event.amount - total(db, InvestmentBankLink, InvestmentBankLink.amount, InvestmentBankLink.event_id == event.id),
+                            **bank_evidence(event, t),
                             days_difference=(event.posting_date - t.posting_date).days))
     return {'from_date': start.isoformat(), 'to_date': end.isoformat(), 'items': sorted(matches, key=lambda m: not m['exact_amount'])}
 
@@ -346,10 +379,14 @@ def link_bank(body: BankBody, db: DB):
         raise HTTPException(409, 'This bank transaction is already linked to the event.')
     if body.amount + total(db, InvestmentBankLink, InvestmentBankLink.amount, InvestmentBankLink.event_id == event.id) > event.amount or body.amount + total(db, InvestmentBankLink, InvestmentBankLink.amount, InvestmentBankLink.transaction_id == transaction.id) > transaction.amount:
         raise HTTPException(422, 'The link exceeds the unlinked investment or bank transaction amount.')
+    find(db, Institution, event.institution_id).revision += 1
     link = InvestmentBankLink(**body.model_dump()); db.add(link); db.flush(); identity = str(link.id); db.commit()
     return {'id': identity}
 
 
 @router.delete('/bank-links/{identity}', status_code=204)
 def unlink_bank(identity: uuid.UUID, db: DB):
-    lock(db); db.delete(find(db, InvestmentBankLink, identity)); db.commit()
+    lock(db)
+    link = find(db, InvestmentBankLink, identity)
+    find(db, Institution, find(db, InvestmentEvent, link.event_id).institution_id).revision += 1
+    db.delete(link); db.commit()

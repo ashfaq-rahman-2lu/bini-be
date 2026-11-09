@@ -7,7 +7,7 @@ FastAPI + PostgreSQL backend for EBL bank statement imports, financial reconcili
 - Python 3.12+
 - Docker with Compose
 
-The frontend, API, and database bind to loopback addresses. This release has no authentication and is intended for local use. Public deployment belongs to the later authentication milestone.
+Local development binds the frontend, API, and database to loopback addresses. The API requires the single account configured with `AUTH_USERNAME`, `AUTH_PASSWORD`, and `AUTH_SECRET`; see authentication setup below.
 
 ## Start locally
 
@@ -18,6 +18,7 @@ docker compose -f infrastructure/compose.yaml up -d --wait
 python3 -m venv .venv
 .venv/bin/python -m pip install -r requirements.lock.txt
 cp .env.example .env
+# Edit .env: set AUTH_USERNAME, AUTH_PASSWORD and AUTH_SECRET before starting.
 .venv/bin/alembic upgrade head
 .venv/bin/python -m uvicorn app.main:app --host 127.0.0.1 --port 8000
 ```
@@ -94,13 +95,13 @@ Restore into a separate, empty database with `pg_restore`; validate before switc
 - `tests/`: synthetic financial/import/concurrency tests and optional private-sample checks.
 - `infrastructure/compose.yaml`: dedicated local PostgreSQL service and persistent volume.
 
-Deferred: authentication/registration, public hosting, Excel export, categories, notes, inline extraction editing, PDF viewer, OCR, and other banks. GraphQL is not required for the REST workflow.
+Deferred: registration/multiple users, Excel export, categories, notes, inline extraction editing, PDF viewer, OCR, and other banks. GraphQL is not required for the REST workflow.
 
 The backend `.gitignore` independently excludes Python environments, caches, local environment files, private PDFs/password files, uploads, data, and backups, including infrastructure-local files. Commit source, migrations, requirements/lockfiles, tests, `.env.example`, and `infrastructure/compose.yaml`. Keep real statements and secrets outside version control.
 
 ## Investment tracking
 
-Apply migrations through `0004` with `.venv/bin/alembic upgrade head` and restart an API process running without `--reload`. Migration `0003` adds seven investment tables; `0004` adds extend/replace import modes and updates document uniqueness. Existing imports default to extend; neither migration deletes application rows or rewrites the bank ledger. No additional packages or infrastructure are required.
+Apply migrations through `0005` with `.venv/bin/alembic upgrade head` and restart an API process running without `--reload`. Migration `0003` adds seven investment tables; `0004` adds extend/replace import modes and updates document uniqueness. Existing imports default to extend; neither migration deletes application rows or rewrites the bank ledger. No additional packages or infrastructure are required.
 
 Use **Investments → Import investment CSV** for the institution's multiline UTF-8 BDT export (maximum 2 MB / 10,000 rows). Review the extracted transactions and warnings before confirming. Drafts do not affect investment totals. Cancelling removes draft source data. Confirmed CSV bytes, parsed original columns, and source row references are retained privately in PostgreSQL. No downloaded CSV or password is bundled with either repository.
 
@@ -130,9 +131,9 @@ Column J accepts the updater's `=SUM($D$20:D20)-SUM($E$20:E20)-SUM($F$20:F20)` r
 
 Summary “Ready Balance” accepts a reference to TOTAL's G cell (for example `=G91`); “Total Currently Invested” accepts the sum of TOTAL's J and G cells (`=J91+G91`). The parser validates both references against the actual TOTAL record, resolves them with Decimal arithmetic, and rejects arbitrary expressions. Numeric summaries remain supported: Ready Balance must reconcile exactly, while a differing numeric Total Currently Invested produces a warning against final capital with business **plus** ready balance. Formula and equivalent numeric summaries do not change transaction duplicate identities.
 
-Trace returned funds by allocating an installment/refund to one or more later reinvestments or cashouts. A destination can combine multiple source returns. The CSV's pooled wallet does not establish this attribution automatically. Traces cannot exceed either side, cross institutions, or consume future returns. Follow a cashout trace to its bank links to see whether the payout actually appears in the bank ledger. Remove incorrect traces/links before replacing them.
+Trace returned funds by allocating an installment/refund to one or more later reinvestments or cashouts. A destination can combine multiple source returns. Reconciliation derives attribution only when source order, whole-credit amounts, wallet balances and business ownership establish a unique answer. Otherwise it requires review. Traces cannot exceed either side, cross institutions, or consume future returns. Follow a cashout trace to its bank links to see whether the payout actually appears in the bank ledger. Remove incorrect traces/links before replacing them.
 
-Bank suggestions use BDT and the correct debit/credit direction. For an external investment booked on July 2, the default search includes bank debits June 29–July 2. Cashouts search bank credits from the payout date through three days later. The UI can widen the window to 30 days or look up a bank transaction ID manually. Multiple candidates always require a choice. Split/combined transfers use explicit link amounts; a bank transaction's capacity is shared across all investment events and institutions. A PostgreSQL advisory transaction lock serializes all investment mutations to prevent concurrent over-allocation; bank transactions themselves are unchanged.
+Bank suggestions use BDT and the correct debit/credit direction. For an external investment booked on July 2, the default search includes bank debits June 29–July 2. Cashouts search bank credits from the payout date through three days later. The UI can widen the window to 30 days or look up a bank transaction ID manually. Uniquely resolved exact matches with the configured description patterns can be saved automatically by reconciliation. Multiple candidates require a choice. Split/combined transfers use explicit link amounts; a bank transaction's capacity is shared across all investment events and institutions. A PostgreSQL advisory transaction lock serializes all investment mutations to prevent concurrent over-allocation; bank transactions themselves are unchanged.
 
 REST endpoints:
 
@@ -144,8 +145,68 @@ REST endpoints:
 - `GET /api/investments/events/{id}/bank-candidates` — direction/date/account suggestions.
 - `POST /api/investments/bank-links`, `DELETE /api/investments/bank-links/{id}` — explicit bank transfer links.
 
-All monetary responses are decimal strings. This local release returns the investment workspace as one consistent snapshot; the UI paginates activity in groups of 50. Institution naming/account ownership and hosting authentication remain future work. Import earlier history before marking a partially covered project complete. Renaming a campaign or changing a provider's historical balances requires reviewing changed records rather than assuming they are duplicates.
+All monetary responses are decimal strings. This release returns the investment workspace as one consistent snapshot; the UI paginates activity in groups of 50. Institution naming and per-user account ownership remain future work: the configured single account accesses the whole workspace. Import earlier history before marking a partially covered project complete. Renaming a campaign or changing a provider's historical balances requires reviewing changed records rather than assuming they are duplicates.
 
 Import upload accepts multipart `mode=extend|replace` (default `extend`). Import listings/reviews return `mode`; draft replacement reviews additionally return removal counts in `replacement`. Confirmations send `expected_revision`, `acknowledge_warnings`, and, for replacement, `acknowledge_replace`. Invalid mode, malformed CSV, missing acknowledgment, and stale revision are rejected before any deletion.
 
 Tests use the dedicated `*_test` database, now also resetting investment data. `RUN_PRIVATE_SAMPLES=1` optionally validates the local investment CSV; default tests use generated synthetic CSVs. To intentionally clear *all* application data later, investment bank links and traces must be removed before bank transactions; existing bank-only DELETE sequences will be blocked by these new foreign keys. No application-data reset occurs during migrations.
+
+
+## Wallet reconciliation and project money trails
+
+Migration `0005` adds reconciliation cases with review history and reinvestment group associations, plus provenance, explanations and timestamps on return allocations and bank links. Existing links default to **manual** and are preserved. Their new timestamp records migration time, since their original creation time was not previously recorded. The migration does not generate money links or alter bank transactions/source documents.
+
+Run `alembic upgrade head` before starting the updated API. The initial matching action is **Reconcile now**. CSV and bank-statement confirmation in the frontend subsequently sends a separate reconciliation POST; failure leaves the completed import intact and offers retry. GET endpoints only calculate/read results. New imports and all link/review mutations advance review revisions. Bank confirmations and investment writes share the investment advisory lock, then acquire any account/statement locks in that order.
+
+The pure service in `app/investment_reconciliation.py` merges confirmed source-ordinal ordering constraints and replays each canonical event once. It rejects conflicting or indeterminate same-day order. Nonzero opening funds with unknown business ownership, negative wallets, inconsistent balances and unresolved consumption block dependent wallet matching. Unallocated money is never presented as confirmed available cash in an unresolved wallet. Bank matching continues independently.
+
+A cashout leaving a positive wallet must consume whole outstanding credits from exactly one business. Full-wallet cashouts consume all available credits, including multiple businesses. Automatic attribution requires a unique combination; bounded searches stop for review rather than using FIFO or claiming uniqueness from incomplete results.
+
+Reinvestment reserves source credits against the destination funding event. Associated settlement rows release those reservations; they are not a second investment or a bank transfer. A single unambiguous same-day funding group may be associated automatically, including its bank top-up. Multiple groups require reviewed settlement associations. Grouping can be reviewed before attribution. An available balance different from reinvestment funding produces a delayed-booking case. Select the actual credits, explain the earlier instruction/later booking, and optionally record the instruction date. Later credits remain available. Reviews cannot consume future credits or exclude known earlier available funds from the full-wallet instruction.
+
+Bank automation requires BDT, correct debit/credit direction, an exact remaining-amount match, and the expected normalized description: `Other Bank Transfer SKB-BEFTN` for funding; `EFT INFLOW - THE CITY BANK LTD., CBL, Payment,` for receipts. Funding searches zero–three calendar days before booking; cashouts search zero–three days after. Competing events across institutions prevent automatic matching. BUSINESS DATE is supporting metadata and never replaces bank posting date. Manual matching still supports wider dates and split/combined transfers. Previously automatic decisions are revalidated when history changes; conflicting links remain visible for review and are not silently overwritten.
+
+Project trails contain direct funding, installments, their cashouts/reinvestments, settlement groups and related bank links. Shared destinations show all contributing installments, with each project's own share of a full bank receipt. If a mixed payout is split among bank receipts, the project share of each receipt remains unknown; no proportional share is invented. Subsequent returns of a destination project belong to that project. Profit/principal classifications remain unchanged.
+
+Additional REST endpoints:
+
+- `GET /api/investments/reconciliation` — fresh analysis, revision token, saved cases and review history. Unsaved unique proposals are identified separately.
+- `POST /api/investments/reconciliation/run` — atomically save unique allocations, bank matches, associations and current review cases; repeatable without duplicates.
+- `PATCH /api/investments/reconciliation/cases/{id}` — review with `expected_revision`, `explanation`, selected `allocations`, `association_ids` or `bank_links`, and optional `delayed_booking` / `instruction_date`. Stale decisions return 409; invalid amounts roll back.
+- `DELETE /api/investments/reconciliation/associations/{id}` — remove an incorrect association explicitly, then reconcile again.
+- `GET /api/investments/projects/{id}/trail` — direct movements, wallet availability/reservations/consumption, source references, provenance and related bank receipts.
+
+Extend imports preserve decisions and revalidate them. Replace previews include reconciliation case and association counts; confirmation clears that institution's reconciliation data atomically with its old investment data. Bank records and other institutions remain untouched. Source discrepancies still require correcting/reviewing the CSV; reconciliation never weakens TOTAL or running-balance validation.
+
+`tests/test_reconciliation.py` exercises the synthetic Apon example, whole-wallet and automatic payouts, ambiguity, delayed booking, split settlements, posting/business dates, overlap/order, bank capacity, later imports, concurrency, revision conflicts and direct-only trails. Use the existing dedicated `_test` database setup; do not run backend and browser suites simultaneously against it.
+
+Project updates accept `confirm_wallet_empty: true` with closed status and complete-history acknowledgment. Under the investment write lock, completion rejects returns without full saved allocations or with available/reserved wallet funds. Closing does not change allocations, bank records, or wallet balances; reopening uses the existing active status. No schema migration is required.
+
+### Reviewed small wallet differences
+
+Wallet source reviews can explicitly accept an absolute difference up to **BDT 5.00**. The server calculates `selected source credits − recorded payment`, validates whole-credit capacities, and stores the signed decimal-string difference, source selection, explanation, timestamp and original evidence in the existing reconciliation resolution history. No migration is needed. No differences are accepted automatically; CSV validation and bank matching remain exact.
+
+Source allocations retain their full credit amounts. For these settlements they represent gross source contributions, not exact net shares. The difference belongs to the settlement pool rather than an arbitrary business. It is excluded from spendable wallet attribution, retained separately from the provider's original Ready Balance, and exposed in reconciliation, event and project-trail responses. A shortfall that leaves other credits without verified backing blocks dependent wallet spending. Related bank shares remain unassigned where the difference prevents exact attribution. Original investment, return, profit and bank amounts remain unchanged. Removing/changing source connections invalidates the accepted difference until reviewed again. Extend preserves the evidence; replace clears it with the institution's existing reconciliation history.
+
+## Single-account authentication
+
+Set these only in the backend `.env` locally, or in Render's environment settings:
+
+```dotenv
+AUTH_USERNAME=admin
+AUTH_PASSWORD=<your-long-unique-password>
+AUTH_SECRET=<random-signing-secret-at-least-32-characters>
+AUTH_COOKIE_SECURE=true
+```
+
+Use your password manager to generate and save a strong password and a separate random signing secret (for example, `python3 -c 'import secrets; print(secrets.token_urlsafe(48))'`). The placeholders above are not working credentials. Missing credentials or a signing secret shorter than 32 characters cause login and protected routes to return 503; there is no default password or authentication bypass. Restart the backend after changing configuration. Never commit `.env` or put these values into frontend variables.
+
+`POST /api/auth/login` accepts JSON `username` and `password`, sets an eight-hour signed `bini_session` cookie, and returns only the username. The browser sends the cookie automatically; JavaScript cannot read it (`HttpOnly`). It uses `SameSite=Lax`, path `/api`, and `Secure` by default. Set `AUTH_COOKIE_SECURE=false` only for local HTTP development, as shown in `.env.example`. Keep it `true` on Render.
+
+All financial and PDF routes require the cookie. `GET /api/auth/session` restores the frontend session after refresh; `POST /api/auth/logout` deletes the cookie. Every POST/PATCH/DELETE request, including login/logout, must include `X-Bini-Request: 1`. If an Origin header is present, it must be in `ALLOWED_ORIGINS`; credentialed CORS preflights also enforce that list. The frontend supplies this protection header automatically. API responses use `Cache-Control: no-store`. `/api/health` remains public. `/docs` and `/openapi.json` expose descriptions, not financial records; command-line API clients need a cookie jar and the protection header.
+
+Changing the username, password, or signing secret invalidates existing sessions. Keep the secret consistent across workers/instances. Sessions are stateless: sign-out deletes this browser's cookie and clears the frontend cache; a separately copied cookie remains valid until expiry or credential/secret rotation. Ten failed logins within one minute temporarily block further attempts in that process. The limiter resets on restart and is independent per worker.
+
+No authentication tables, database migrations, or Supabase Auth configuration are needed. All signed-in requests access the same workspace. For Netlify + Render, use the frontend's `/api` proxy setup in its README so the cookie works on the provider's default domains. Set `ALLOWED_ORIGINS` to the exact HTTPS frontend origin, for example `["https://your-site.netlify.app"]`. Direct requests from `netlify.app` to `onrender.com` are cross-site and will not carry this Lax cookie. Same-site HTTPS custom domains are an alternative. Keep the unused Supabase Data API disabled for the existing deployment plan.
+
+The pytest fixtures use separate synthetic credentials and cookie-authenticated clients. Authentication tests run without a database and cover cookie flags, logout, expiry/tampering, credential rotation, fail-closed configuration, every data route, CSRF/CORS, public health checks, and login throttling.

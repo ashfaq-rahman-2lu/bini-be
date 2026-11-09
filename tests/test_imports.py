@@ -115,7 +115,7 @@ def test_printed_count_and_out_of_period_failures(client, pdf_factory):
 def test_source_details_and_database_persistence_across_clients(client, pdf_factory):
     first = upload(client, pdf_factory()).json(); confirm(client, first)
     second = upload(client, pdf_factory(memo='Overlapping copy')).json(); confirm(client, second)
-    with TestClient(app) as restarted:
+    with TestClient(app, headers=client.headers, cookies=client.cookies) as restarted:
         items = restarted.get('/api/transactions').json()['items']
         assert len(items) == 2
         details = restarted.get('/api/transactions/' + items[0]['id']).json()
@@ -190,7 +190,7 @@ def test_concurrent_confirmations_are_atomic(client, pdf_factory):
     first = upload(client, pdf_factory()).json()
     second = upload(client, pdf_factory(memo="concurrent overlap")).json()
     def send(draft):
-        with TestClient(app) as c:
+        with TestClient(app, headers=client.headers, cookies=client.cookies) as c:
             return confirm(c, draft).status_code
     with ThreadPoolExecutor(max_workers=2) as executor:
         statuses = list(executor.map(send, [first, second]))
@@ -206,7 +206,7 @@ def test_concurrent_confirmations_are_atomic(client, pdf_factory):
 def test_concurrent_identical_uploads_reuse_draft(client, pdf_factory):
     pdf = pdf_factory()
     def send(_):
-        with TestClient(app) as c:
+        with TestClient(app, headers=client.headers, cookies=client.cookies) as c:
             response = upload(c, pdf)
             assert response.status_code == 200, response.text
             return response.json()['id']

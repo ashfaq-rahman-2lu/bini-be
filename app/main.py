@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Annotated, Literal
 from urllib.parse import quote
 
-from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, Response, UploadFile
+from fastapi import APIRouter, Depends, FastAPI, File, Form, HTTPException, Query, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import case, func, select
 from sqlalchemy.dialects.postgresql import insert
@@ -17,16 +17,29 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from .config import settings
+from .auth import require_auth, router as auth_router
 from .db import get_db
 from .matching import FIELDS, review, transaction_view
 from .models import Account, SourceLink, Statement, StatementRow, Transaction
 from .schemas import AccountView, Confirmation, Decisions, ImportSummary, ImportView, TransactionList
-from .investments import router as investment_router
+from .investments import router as investment_router, lock as investment_lock
+from .reconciliation_api import router as reconciliation_router
 
 app = FastAPI(title="Bini · Bank statement ledger", version="0.1.0")
-app.include_router(investment_router)
+app.include_router(auth_router)
+protected = APIRouter(dependencies=[Depends(require_auth)])
+protected.include_router(investment_router)
+protected.include_router(reconciliation_router)
 app.add_middleware(CORSMiddleware, allow_origins=settings.allowed_origins,
-                   allow_methods=["GET", "POST", "PATCH", "DELETE"], allow_headers=["Content-Type"])
+                   allow_methods=["GET", "POST", "PATCH", "DELETE"], allow_headers=["Content-Type", "X-Bini-Request"], allow_credentials=True)
+@app.middleware("http")
+async def private_api_responses(request, call_next):
+    response = await call_next(request)
+    if request.url.path.startswith("/api/"):
+        response.headers["Cache-Control"] = "no-store"
+    return response
+
+
 DB = Annotated[Session, Depends(get_db)]
 
 
@@ -67,7 +80,7 @@ def process_pdf(data, password, operation="extract"):
     return output["result"]
 
 
-@app.post("/api/pdfs/unlock", response_class=Response)
+@protected.post("/api/pdfs/unlock", response_class=Response)
 def unlock(file: UploadFile = File(...), password: str = Form("")):
     data = file.file.read(10 * 1024 * 1024 + 1)
     if len(data) > 10 * 1024 * 1024:
@@ -80,14 +93,14 @@ def unlock(file: UploadFile = File(...), password: str = Form("")):
     })
 
 
-@app.get("/api/imports", response_model=list[ImportSummary])
+@protected.get("/api/imports", response_model=list[ImportSummary])
 def list_imports(db: DB, limit: int = Query(50, ge=1, le=100)):
     return [dict(row._mapping) for row in db.execute(select(
         Statement.id, Statement.filename, Statement.status, Statement.created_at,
     ).order_by(Statement.created_at.desc(), Statement.id.desc()).limit(limit))]
 
 
-@app.post("/api/imports", response_model=ImportView)
+@protected.post("/api/imports", response_model=ImportView)
 def upload(db: DB, file: UploadFile = File(...), password: str = Form("")):
     data = file.file.read(10 * 1024 * 1024 + 1)
     if len(data) > 10 * 1024 * 1024:
@@ -129,12 +142,12 @@ def persist_import(db, file, data, fingerprint, parsed):
     return statement
 
 
-@app.get("/api/imports/{statement_id}", response_model=ImportView)
+@protected.get("/api/imports/{statement_id}", response_model=ImportView)
 def get_import(statement_id: uuid.UUID, db: DB):
     return review(db, statement_or_404(db, statement_id))
 
 
-@app.patch("/api/imports/{statement_id}/decisions", response_model=ImportView)
+@protected.patch("/api/imports/{statement_id}/decisions", response_model=ImportView)
 def decisions(statement_id: uuid.UUID, body: Decisions, db: DB):
     statement = statement_or_404(db, statement_id, lock=True)
     if statement.status != "draft":
@@ -155,8 +168,11 @@ def decisions(statement_id: uuid.UUID, body: Decisions, db: DB):
     return review(db, statement)
 
 
-@app.post("/api/imports/{statement_id}/confirm", response_model=ImportView)
+@protected.post("/api/imports/{statement_id}/confirm", response_model=ImportView)
 def confirm(statement_id: uuid.UUID, body: Confirmation, db: DB):
+    # A new bank occurrence can change uniqueness in an investment review.
+    # Take the shared lock first, before the existing account/statement locks.
+    investment_lock(db)
     statement = statement_or_404(db, statement_id, lock=True)
     if statement.status == "confirmed":
         return review(db, statement)
@@ -183,7 +199,7 @@ def confirm(statement_id: uuid.UUID, body: Confirmation, db: DB):
     return review(db, statement)
 
 
-@app.delete("/api/imports/{statement_id}", status_code=204)
+@protected.delete("/api/imports/{statement_id}", status_code=204)
 def cancel(statement_id: uuid.UUID, db: DB):
     statement = statement_or_404(db, statement_id, lock=True)
     if statement.status == "confirmed":
@@ -193,12 +209,12 @@ def cancel(statement_id: uuid.UUID, db: DB):
     return Response(status_code=204)
 
 
-@app.get("/api/accounts", response_model=list[AccountView])
+@protected.get("/api/accounts", response_model=list[AccountView])
 def accounts(db: DB):
     return [{"id": a.id, "label": a.label, "currency": a.currency} for a in db.scalars(select(Account).order_by(Account.label, Account.id))]
 
 
-@app.get("/api/transactions", response_model=TransactionList)
+@protected.get("/api/transactions", response_model=TransactionList)
 def transactions(db: DB, search: str = Query("", max_length=500), from_date: date | None = None,
                  to_date: date | None = None, direction: Literal["debit", "credit"] | None = None,
                  account_id: uuid.UUID | None = None, page: int = Query(1, ge=1),
@@ -227,7 +243,7 @@ def transactions(db: DB, search: str = Query("", max_length=500), from_date: dat
             "page_size": page_size, "debit_total": debit, "credit_total": credit, "net": credit-debit}
 
 
-@app.get("/api/transactions/{transaction_id}")
+@protected.get("/api/transactions/{transaction_id}")
 def transaction_detail(transaction_id: uuid.UUID, db: DB):
     transaction = db.get(Transaction, transaction_id)
     if transaction is None:
@@ -241,3 +257,6 @@ def transaction_detail(transaction_id: uuid.UUID, db: DB):
     output["sources"] = [{"statement_id": s.id, "filename": s.filename, "page": r.page,
                           "ordinal": r.ordinal, "raw_text": r.raw_text, "location": r.location} for r, s in sources]
     return output
+
+
+app.include_router(protected)
