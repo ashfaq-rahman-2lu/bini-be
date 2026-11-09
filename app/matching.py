@@ -20,9 +20,10 @@ def transaction_view(row):
     return {key: getattr(row, key, None) for key in ["id", "account_id", "posting_date", "direction", "amount", "balance", "description", "reference"]}
 
 
-def review(session, statement):
+def review(session, statement, *, rows=None):
     account = session.get(Account, statement.account_id)
-    rows = list(session.scalars(select(StatementRow).where(StatementRow.statement_id == statement.id).order_by(StatementRow.ordinal)))
+    if rows is None:
+        rows = list(session.scalars(select(StatementRow).where(StatementRow.statement_id == statement.id).order_by(StatementRow.ordinal)))
     # Scope the lookup to the imported period, not the entire ledger.
     transactions = list(session.scalars(select(Transaction).where(
         Transaction.account_id == account.id,

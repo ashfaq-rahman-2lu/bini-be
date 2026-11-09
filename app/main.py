@@ -17,6 +17,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from .config import settings
+from .request_logging import RequestTimingMiddleware
 from .auth import require_auth, router as auth_router
 from .db import get_db
 from .matching import FIELDS, review, transaction_view
@@ -38,6 +39,9 @@ async def private_api_responses(request, call_next):
     if request.url.path.startswith("/api/"):
         response.headers["Cache-Control"] = "no-store"
     return response
+
+
+app.add_middleware(RequestTimingMiddleware)
 
 
 DB = Annotated[Session, Depends(get_db)]
@@ -176,27 +180,35 @@ def confirm(statement_id: uuid.UUID, body: Confirmation, db: DB):
     statement = statement_or_404(db, statement_id, lock=True)
     if statement.status == "confirmed":
         return review(db, statement)
-    current = review(db, statement)
+    # Retain ORM rows through validation and persistence. Reloading each row and
+    # flushing each transaction makes confirmation depend on per-row DB latency.
+    rows = list(db.scalars(select(StatementRow).where(
+        StatementRow.statement_id == statement.id).order_by(StatementRow.ordinal)))
+    current = review(db, statement, rows=rows)
     if current["revision"] != body.expected_revision:
         raise HTTPException(409, "The account changed since this review. Refresh the review and confirm again.")
     if not current["can_confirm"]:
         raise HTTPException(409, "Resolve duplicate decisions and reconciliation failures before confirming.")
+    rows_by_id = {row.id: row for row in rows}
+    new_transactions = {}
     for proposal in current["rows"]:
-        row = db.get(StatementRow, proposal["id"])
+        row = rows_by_id[proposal["id"]]
         if proposal["effective"] == "new":
-            transaction = Transaction(account_id=statement.account_id,
+            new_transactions[row.id] = Transaction(id=uuid.uuid4(), account_id=statement.account_id,
                 **{field: getattr(row, field) for field in (*FIELDS, "description")})
-            db.add(transaction)
-            db.flush()
-            target = transaction.id
-        else:
-            target = proposal["target_id"]
+    db.add_all(new_transactions.values())
+    # Insert all canonical rows together before writing their foreign-key links.
+    # This flush and all subsequent updates remain in the same locked transaction.
+    db.flush()
+    for proposal in current["rows"]:
+        row = rows_by_id[proposal["id"]]
+        target = new_transactions[row.id].id if proposal["effective"] == "new" else proposal["target_id"]
         row.decision, row.match_id = proposal["effective"], target
         db.add(SourceLink(transaction_id=target, statement_row_id=row.id))
     statement.status = "confirmed"
     db.get(Account, statement.account_id).revision += 1
     db.commit()
-    return review(db, statement)
+    return review(db, statement, rows=rows)
 
 
 @protected.delete("/api/imports/{statement_id}", status_code=204)

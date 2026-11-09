@@ -20,6 +20,9 @@ os.environ["AUTH_PASSWORD"] = "test-only-login-password"
 os.environ["AUTH_SECRET"] = "test-only-signing-secret-at-least-32-characters"
 
 os.environ["AUTH_COOKIE_SECURE"] = "false"
+# Never forward synthetic tests using a developer's configured source token.
+os.environ["BETTERSTACK_SOURCE_TOKEN"] = ""
+os.environ["BETTERSTACK_INGESTION_URL"] = ""
 
 from fastapi.testclient import TestClient
 from sqlalchemy import text
@@ -29,8 +32,8 @@ from app.main import app
 
 @pytest.fixture(autouse=True)
 def empty_ledger(request):
-    if request.module.__name__ == "test_auth":
-        return  # Authentication tests deliberately need no database connection.
+    if request.module.__name__ in {"test_auth", "test_request_logging"}:
+        return  # Authentication and logging tests need no database connection.
     with engine.begin() as connection:
         connection.execute(text("TRUNCATE investment_institutions, source_links, statement_rows, transactions, statements, accounts CASCADE"))
 
