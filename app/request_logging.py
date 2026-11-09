@@ -9,6 +9,9 @@ from time import perf_counter
 from urllib.parse import urlsplit
 
 from .config import settings
+from .performance import Timings, current_timings
+
+PROCESS_STARTED = perf_counter()
 
 
 class RequestJSONFormatter(logging.Formatter):
@@ -22,6 +25,8 @@ class RequestJSONFormatter(logging.Formatter):
             "service": "bini-api",
             "environment": settings.log_environment,
             "request": getattr(record, "request", {}),
+            "performance": getattr(record, "performance", {}),
+            "job": getattr(record, "job", {}),
         }, separators=(",", ":"))
 
 
@@ -68,6 +73,8 @@ class RequestTimingMiddleware:
             return await self.app(scope, receive, send)
         request_id = uuid.uuid4().hex
         started = perf_counter()
+        stats = Timings()
+        timing_token = current_timings.set(stats)
         status = None
         response_started_ms = None
         disconnected = False
@@ -116,7 +123,10 @@ class RequestTimingMiddleware:
                 self.logger.log(level, "HTTP request completed", extra={
                     "service": "bini-api", "environment": settings.log_environment,
                     "request": request,
+                    "performance": dict(stats.snapshot(), process_uptime_ms=round((started - PROCESS_STARTED) * 1000, 3)),
                 })
             except Exception:
                 # Logging failures must not change the API result or mask errors.
                 pass
+            finally:
+                current_timings.reset(timing_token)

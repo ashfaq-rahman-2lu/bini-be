@@ -17,6 +17,7 @@ class Settings(BaseSettings):
     log_environment: str = "development"
     betterstack_source_token: SecretStr = SecretStr("")
     betterstack_ingestion_url: str = ""
+    jobs_enabled: bool = True
 
 
 settings = Settings()

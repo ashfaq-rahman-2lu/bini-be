@@ -23,6 +23,7 @@ os.environ["AUTH_COOKIE_SECURE"] = "false"
 # Never forward synthetic tests using a developer's configured source token.
 os.environ["BETTERSTACK_SOURCE_TOKEN"] = ""
 os.environ["BETTERSTACK_INGESTION_URL"] = ""
+os.environ["JOBS_ENABLED"] = "false"
 
 from fastapi.testclient import TestClient
 from sqlalchemy import text
@@ -35,7 +36,7 @@ def empty_ledger(request):
     if request.module.__name__ in {"test_auth", "test_request_logging"}:
         return  # Authentication and logging tests need no database connection.
     with engine.begin() as connection:
-        connection.execute(text("TRUNCATE investment_institutions, source_links, statement_rows, transactions, statements, accounts CASCADE"))
+        connection.execute(text("TRUNCATE operation_jobs, investment_institutions, source_links, statement_rows, transactions, statements, accounts CASCADE"))
 
 
 @pytest.fixture

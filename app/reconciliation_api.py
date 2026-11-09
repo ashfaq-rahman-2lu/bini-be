@@ -10,6 +10,9 @@ from types import SimpleNamespace
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 from sqlalchemy import select
+from sqlalchemy.orm import load_only
+
+from .performance import phase
 
 from .investment_models import (Institution, InvestmentBankLink, InvestmentEvent, InvestmentImport,
     InvestmentProject, InvestmentSource, ReconciliationCase, ReinvestmentAssociation, ReturnAllocation)
@@ -24,37 +27,64 @@ def record(row, fields):
     return SimpleNamespace(**{k: str(v) if isinstance(v := getattr(row, k), uuid.UUID) else v for k in fields})
 
 
-def analyze(db):
-    owners = list(db.scalars(select(Institution).order_by(Institution.id)))
-    events = list(db.scalars(select(InvestmentEvent)))
+def revision_token(owners, accounts):
+    return hashlib.sha256(json.dumps([[(str(i.id), i.revision) for i in owners], [(str(a.id), a.revision) for a in accounts]], sort_keys=True).encode()).hexdigest()
+
+
+def load_analysis(db):
+    # One request-local snapshot. No shared cache can hide cross-institution
+    # capacity changes; all reconciliation writes hold the existing global lock.
+    with phase('reconciliation_load'):
+        return dict(
+            owners=list(db.scalars(select(Institution).order_by(Institution.id))),
+            events=list(db.scalars(select(InvestmentEvent))),
+            allocations=list(db.scalars(select(ReturnAllocation))),
+            associations=list(db.scalars(select(ReinvestmentAssociation))),
+            links=list(db.scalars(select(InvestmentBankLink))),
+            cases=list(db.scalars(select(ReconciliationCase))),
+            accounts=list(db.scalars(select(Account).order_by(Account.id))),
+            bank=list(db.scalars(select(Transaction))),
+            sources=list(db.execute(select(InvestmentSource, InvestmentImport).join(InvestmentImport)
+                .options(load_only(InvestmentImport.id, InvestmentImport.filename, InvestmentImport.status))
+                .where(InvestmentImport.status == 'confirmed').order_by(InvestmentSource.import_id, InvestmentSource.ordinal))))
+
+
+def analyze(db, data=None):
+    data = load_analysis(db) if data is None else data
+    with phase('reconciliation_compute'):
+        return analyze_loaded(data)
+
+
+def analyze_loaded(data):
+    owners, events, allocations, associations, links, cases, accounts, bank, sources = (
+        data[key] for key in ('owners', 'events', 'allocations', 'associations', 'links', 'cases', 'accounts', 'bank', 'sources'))
     by_id = {str(e.id): e for e in events}
-    allocations = list(db.scalars(select(ReturnAllocation)))
-    associations = list(db.scalars(select(ReinvestmentAssociation)))
-    links = list(db.scalars(select(InvestmentBankLink)))
-    cases = list(db.scalars(select(ReconciliationCase)))
-    accounts = list(db.scalars(select(Account).order_by(Account.id)))
-    bank = list(db.scalars(select(Transaction)))
     bank_by_id = {str(t.id): t for t in bank}
     account_by_id = {a.id: a for a in accounts}
-    sources = list(db.execute(select(InvestmentSource, InvestmentImport).join(InvestmentImport).where(InvestmentImport.status == 'confirmed').order_by(InvestmentSource.import_id, InvestmentSource.ordinal)))
     sequences = defaultdict(list)
     for source, report in sources: sequences[str(report.id)].append(str(source.event_id))
-    token = hashlib.sha256(json.dumps([[(str(i.id), i.revision) for i in owners], [(str(a.id), a.revision) for a in accounts]], sort_keys=True).encode()).hexdigest()
+    token = revision_token(owners, accounts)
     wallets, issues, proposed, groups = {}, [], [], []
+    events_by_owner, cases_by_owner = defaultdict(list), defaultdict(list)
+    allocations_by_owner, associations_by_owner = defaultdict(list), defaultdict(list)
+    for e in events: events_by_owner[e.institution_id].append(e)
+    for c in cases: cases_by_owner[c.institution_id].append(c)
+    for a in allocations: allocations_by_owner[by_id[str(a.target_id)].institution_id].append(a)
+    for a in associations: associations_by_owner[by_id[str(a.funding_id)].institution_id].append(a)
     for owner in owners:
         identity = str(owner.id)
-        own = [record(e, ('id', 'project_id', 'posting_date', 'kind', 'amount', 'ready_balance')) for e in events if e.institution_id == owner.id]
+        own = [record(e, ('id', 'project_id', 'posting_date', 'kind', 'amount', 'ready_balance')) for e in events_by_owner[owner.id]]
         own_ids = {e.id for e in own}
         reviewed = {}
-        decisions = [(str(c.event_id), r) for c in cases if c.institution_id == owner.id for r in c.resolutions if r.get('delayed_booking') or r.get('accept_difference')]
+        decisions = [(str(c.event_id), r) for c in cases_by_owner[owner.id] for r in c.resolutions if r.get('delayed_booking') or r.get('accept_difference')]
         for key, resolution in sorted(decisions, key=lambda pair: pair[1]['reviewed_at']): reviewed[key] = resolution
         outcome = wallet_replay(own, [seq for seq in sequences.values() if seq and seq[0] in own_ids],
-            [record(a, ('source_id', 'target_id', 'amount')) for a in allocations if str(a.target_id) in own_ids and a.provenance == 'manual'],
-            [record(a, ('funding_id', 'event_id')) for a in associations if str(a.funding_id) in own_ids and a.provenance == 'manual'], reviewed)
+            [record(a, ('source_id', 'target_id', 'amount')) for a in allocations_by_owner[owner.id] if str(a.target_id) in own_ids and a.provenance == 'manual'],
+            [record(a, ('funding_id', 'event_id')) for a in associations_by_owner[owner.id] if str(a.funding_id) in own_ids and a.provenance == 'manual'], reviewed)
         desired = {(p['source_id'], p['target_id'], p['amount']) for p in outcome['proposals']}
         wanted_groups = {(g['funding_id'], k) for g in outcome['groups'] for k in g['event_ids']}
-        conflicts = [a for a in allocations if str(a.target_id) in own_ids and a.provenance == 'automatic' and (str(a.source_id), str(a.target_id), cash(a.amount)) not in desired]
-        group_conflicts = [a for a in associations if str(a.funding_id) in own_ids and a.provenance == 'automatic' and (str(a.funding_id), str(a.event_id)) not in wanted_groups]
+        conflicts = [a for a in allocations_by_owner[owner.id] if str(a.target_id) in own_ids and a.provenance == 'automatic' and (str(a.source_id), str(a.target_id), cash(a.amount)) not in desired]
+        group_conflicts = [a for a in associations_by_owner[owner.id] if str(a.funding_id) in own_ids and a.provenance == 'automatic' and (str(a.funding_id), str(a.event_id)) not in wanted_groups]
         if conflicts or group_conflicts:
             outcome['issues'].append(dict(key='prior_automatic:wallet', kind='prior_automatic', event_id=None,
                 message='Earlier automatic decisions no longer follow uniquely from the current source history. Existing links were preserved. Remove the conflicting links and reconcile again.',
@@ -80,6 +110,10 @@ def analyze(db):
             manual_pairs.add((str(link.event_id), str(link.transaction_id)))
             manual_bank[str(link.transaction_id)] += link.amount
             manual_event[str(link.event_id)] += link.amount
+    candidates_by_amount = defaultdict(list)
+    for t in bank:
+        if account_by_id[t.account_id].currency == 'BDT':
+            candidates_by_amount[(t.direction, t.amount - manual_bank[str(t.id)])].append(t)
     invalid_bank = set()
     for link in links:
         e, t = by_id[str(link.event_id)], bank_by_id[str(link.transaction_id)]
@@ -95,9 +129,9 @@ def analyze(db):
         remaining = e.amount - manual_event[str(e.id)]
         if remaining <= ZERO: continue
         matches = []
-        for t in bank:
+        direction = 'debit' if e.kind == 'investment' else 'credit'
+        for t in candidates_by_amount[(direction, remaining)]:
             if (str(e.id), str(t.id)) in manual_pairs: continue
-            if account_by_id[t.account_id].currency != 'BDT' or t.amount - manual_bank[str(t.id)] != remaining: continue
             evidence = bank_evidence(e, t)
             if evidence['eligible']:
                 matches.append(dict(transaction_id=str(t.id), amount=cash(remaining), posting_date=t.posting_date.isoformat(),
@@ -193,34 +227,40 @@ def public_snapshot(context):
                       resolutions=c.resolutions) for c in context['cases'] if c.resolutions])
 
 
+@phase('reconciliation')
 def reconcile(db):
-    context = analyze(db)
+    data = load_analysis(db)
+    context = analyze(db, data)
     changed, counts = set(), dict(allocations=0, bank_links=0, associations=0)
     existing = {(str(a.source_id), str(a.target_id)) for a in context['allocations']}
     for p in context['proposals']:
         if (p['source_id'], p['target_id']) in existing: continue
-        db.add(ReturnAllocation(source_id=uuid.UUID(p['source_id']), target_id=uuid.UUID(p['target_id']), amount=Decimal(p['amount']), provenance='automatic', explanation=p['explanation']))
+        item = ReturnAllocation(source_id=uuid.UUID(p['source_id']), target_id=uuid.UUID(p['target_id']), amount=Decimal(p['amount']), provenance='automatic', explanation=p['explanation'])
+        db.add(item); data['allocations'].append(item)
         changed.add(p['institution_id']); counts['allocations'] += 1
     existing_groups = {(str(a.funding_id), str(a.event_id)) for a in context['associations']}
     for g in context['groups']:
         for key in g['event_ids']:
             if (g['funding_id'], key) in existing_groups: continue
-            db.add(ReinvestmentAssociation(funding_id=uuid.UUID(g['funding_id']), event_id=uuid.UUID(key), provenance='automatic', explanation='Unique destination funding and settlement group.'))
+            item = ReinvestmentAssociation(funding_id=uuid.UUID(g['funding_id']), event_id=uuid.UUID(key), provenance='automatic', explanation='Unique destination funding and settlement group.')
+            db.add(item); data['associations'].append(item)
             changed.add(g['institution_id']); counts['associations'] += 1
     for p in context['bank_proposals']:
-        db.add(InvestmentBankLink(event_id=uuid.UUID(p['event_id']), transaction_id=uuid.UUID(p['transaction_id']), amount=Decimal(p['amount']), provenance='automatic', explanation=p['explanation']))
+        item = InvestmentBankLink(event_id=uuid.UUID(p['event_id']), transaction_id=uuid.UUID(p['transaction_id']), amount=Decimal(p['amount']), provenance='automatic', explanation=p['explanation'])
+        db.add(item); data['links'].append(item)
         changed.add(p['institution_id']); counts['bank_links'] += 1
     db.flush()
     # Store issues from the resulting state, not those just resolved by proposals.
-    after = analyze(db)
+    after = analyze(db, data) if any(counts.values()) else context
     saved = {(str(c.institution_id), c.key): c for c in after['cases']}
     active = set()
     for issue in after['issues']:
         key = (issue['institution_id'], issue['key']); active.add(key)
         case = saved.get(key)
         if not case:
-            db.add(ReconciliationCase(institution_id=uuid.UUID(key[0]), key=key[1], event_id=uuid.UUID(issue['event_id']) if issue['event_id'] else None,
-                                      kind=issue['kind'], status='open', details=issue, resolutions=[]))
+            case = ReconciliationCase(institution_id=uuid.UUID(key[0]), key=key[1], event_id=uuid.UUID(issue['event_id']) if issue['event_id'] else None,
+                                      kind=issue['kind'], status='open', details=issue, resolutions=[])
+            db.add(case); data['cases'].append(case)
             changed.add(key[0])
         elif case.status != 'open' or case.details != issue:
             case.status, case.details, case.resolved_at = 'open', issue, None
@@ -231,7 +271,10 @@ def reconcile(db):
     for owner in after['owners']:
         if str(owner.id) in changed: owner.revision += 1
     db.flush()
-    return dict(public_snapshot(analyze(db)), saved=counts)
+    # Case status/details do not alter proposals or accepted differences. Keep
+    # newly persisted case IDs and the new revision without a third replay/read.
+    after['token'] = revision_token(data['owners'], data['accounts'])
+    return dict(public_snapshot(after), saved=counts)
 
 
 @router.get('/reconciliation')

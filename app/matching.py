@@ -3,6 +3,7 @@ from collections import Counter, defaultdict
 from sqlalchemy import select
 
 from .models import Account, StatementRow, Transaction
+from .performance import phase
 
 
 FIELDS = ("posting_date", "direction", "amount", "balance", "normalized_description", "reference")
@@ -20,6 +21,7 @@ def transaction_view(row):
     return {key: getattr(row, key, None) for key in ["id", "account_id", "posting_date", "direction", "amount", "balance", "description", "reference"]}
 
 
+@phase('bank_review')
 def review(session, statement, *, rows=None):
     account = session.get(Account, statement.account_id)
     if rows is None:

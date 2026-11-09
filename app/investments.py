@@ -1,6 +1,7 @@
 """Reviewed investment imports, capital/profit splits and explicit money tracing."""
 import hashlib
 import uuid
+from collections import defaultdict
 from datetime import date, timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -12,6 +13,7 @@ from sqlalchemy import delete, func, or_, select, text
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import Session
 
+from .performance import phase
 from .db import get_db
 from .investment_csv import CSVError, ZERO, parse_investment_csv
 from .investment_models import Institution, InvestmentBankLink, InvestmentEvent, InvestmentImport, InvestmentProject, InvestmentSource, ReturnAllocation, ReconciliationCase, ReinvestmentAssociation
@@ -26,7 +28,9 @@ PositiveMoney = Annotated[Decimal, Field(gt=0, max_digits=18, decimal_places=2, 
 
 def lock(db):
     # Shared by all investment writes, including cross-institution bank allocations.
-    db.execute(text('SELECT pg_advisory_xact_lock(2048261106)'))
+    db.connection()
+    with phase('lock_wait'):
+        db.execute(text('SELECT pg_advisory_xact_lock(2048261106)'))
 
 
 def find(db, model, identity):
@@ -53,6 +57,7 @@ def event_view(event):
                 ready_balance=cash(event.ready_balance), reported_capital=cash(event.reported_capital))
 
 
+@phase('investment_preview')
 def preview(db, draft):
     institution = find(db, Institution, draft.institution_id)
     replacing = draft.mode == 'replace' and draft.status == 'draft'
@@ -85,7 +90,8 @@ def upload(db: DB, file: UploadFile = File(...), institution: str = Form('Biniyo
         raise HTTPException(422, 'Enter an institution name of 1–120 characters.')
     data = file.file.read(2 * 1024 * 1024 + 1)
     try:
-        parsed = parse_investment_csv(data)
+        with phase('csv_parse'):
+            parsed = parse_investment_csv(data)
     except CSVError as exc:
         raise HTTPException(422, str(exc)) from None
     lock(db)
@@ -108,8 +114,8 @@ def upload(db: DB, file: UploadFile = File(...), institution: str = Form('Biniyo
 
 @router.get('/imports')
 def imports(db: DB):
-    return [dict(id=str(d.id), filename=d.filename, institution=i.name, status=d.status, mode=d.mode, created_at=d.created_at.isoformat())
-            for d, i in db.execute(select(InvestmentImport, Institution).join(Institution).order_by(InvestmentImport.created_at.desc()).limit(100))]
+    return [dict(id=str(d.id), filename=d.filename, institution=d.institution, status=d.status, mode=d.mode, created_at=d.created_at.isoformat())
+            for d in db.execute(select(InvestmentImport.id, InvestmentImport.filename, InvestmentImport.status, InvestmentImport.mode, InvestmentImport.created_at, Institution.name.label('institution')).join(Institution).order_by(InvestmentImport.created_at.desc()).limit(100))]
 
 
 @router.get('/imports/{identity}')
@@ -139,6 +145,10 @@ def clear_institution(db, owner_id, keep_import):
 
 @router.post('/imports/{identity}/confirm')
 def confirm(identity: uuid.UUID, body: Confirm, db: DB):
+    return confirm_import(identity, body, db)
+
+
+def confirm_import(identity, body, db, *, commit=True):
     lock(db)
     draft = find(db, InvestmentImport, identity)
     if draft.status == 'confirmed':
@@ -154,26 +164,36 @@ def confirm(identity: uuid.UUID, body: Confirm, db: DB):
         clear_institution(db, owner.id, draft.id)
     projects = {p.name: p for p in db.scalars(select(InvestmentProject).where(InvestmentProject.institution_id == owner.id))}
     existing = {(e.signature, e.occurrence): e for e in db.scalars(select(InvestmentEvent).where(InvestmentEvent.institution_id == owner.id))}
+    new_projects, new_events, sources = [], [], []
     for row in draft.parsed['rows']:
         key = (row['signature'], row['occurrence'])
         event = existing.get(key)
         if event is None:
             name = row['project']
             if name and name not in projects:
-                projects[name] = InvestmentProject(institution_id=owner.id, name=name)
-                db.add(projects[name]); db.flush()
+                projects[name] = InvestmentProject(id=uuid.uuid4(), institution_id=owner.id, name=name, status='active')
+                new_projects.append(projects[name])
             if name and projects[name].status == 'closed':
                 raise HTTPException(409, 'This export adds activity to a closed project. Reopen the project and refresh before confirming.')
-            event = InvestmentEvent(institution_id=owner.id, project_id=projects[name].id if name else None,
+            event = InvestmentEvent(id=uuid.uuid4(), institution_id=owner.id, project_id=projects[name].id if name else None,
                                     **{k: row[k] for k in ('signature', 'occurrence', 'kind', 'amount', 'description', 'reported_profit', 'ready_balance', 'reported_capital')},
                                     posting_date=date.fromisoformat(row['posting_date']))
-            db.add(event); db.flush(); existing[key] = event
-        db.add(InvestmentSource(import_id=draft.id, ordinal=row['ordinal'], event_id=event.id))
+            new_events.append(event); existing[key] = event
+        sources.append(InvestmentSource(id=uuid.uuid4(), import_id=draft.id, ordinal=row['ordinal'], event_id=event.id))
+    # Respect FK order without one database flush per CSV row. All phases remain
+    # in the same transaction; any validation or insert failure rolls back all.
+    with phase('investment_write'):
+        db.add_all(new_projects)
+        db.flush()
+        db.add_all(new_events)
+        db.flush()
+        db.add_all(sources)
     draft.status = 'confirmed'
     owner.revision += 1
     db.flush()
     result = preview(db, draft)
-    db.commit()
+    if commit:
+        db.commit()
     return result
 
 
@@ -187,6 +207,7 @@ def cancel(identity: uuid.UUID, db: DB):
 
 
 @router.get('')
+@phase('investment_workspace')
 def workspace(db: DB):
     # One consistent snapshot for totals, links and available allocation amounts.
     db.connection(execution_options={'isolation_level': 'REPEATABLE READ'})
@@ -204,9 +225,16 @@ def workspace(db: DB):
         incoming[allocation.target_id] = incoming.get(allocation.target_id, ZERO) + allocation.amount
     for link, _, _ in bank_links:
         bank[link.event_id] = bank.get(link.event_id, ZERO) + link.amount
+    events_by_project, events_by_institution, allocations_by_source = defaultdict(list), defaultdict(list), defaultdict(list)
+    for e in events:
+        events_by_project[e.project_id].append(e)
+        events_by_institution[e.institution_id].append(e)
+    for a in allocations:
+        allocations_by_source[a.source_id].append(a)
     result = []
     for p in projects:
-        rows = [e for e in events if e.project_id == p.id]
+        rows = events_by_project[p.id]
+        project_allocations = [a for e in rows for a in allocations_by_source[e.id]]
         invested = sum((e.amount for e in rows if e.kind in ('investment', 'reinvestment')), ZERO)
         repaid = sum((e.amount for e in rows if e.kind in ('repayment', 'refund')), ZERO)
         classified = [e for e in rows if e.kind == 'repayment' and e.principal is not None]
@@ -214,9 +242,8 @@ def workspace(db: DB):
         principal = refunds + sum((e.principal for e in classified), ZERO)
         unclassified = sum((e.amount for e in rows if e.kind == 'repayment' and e.principal is None), ZERO)
         profit = sum((e.amount - e.principal for e in classified), ZERO)
-        row_ids = {e.id for e in rows}
-        cashout = sum((a.amount for a in allocations if a.source_id in row_ids and by_id[a.target_id].kind == 'cashout'), ZERO)
-        reinvested = sum((a.amount for a in allocations if a.source_id in row_ids and by_id[a.target_id].kind == 'reinvestment'), ZERO)
+        cashout = sum((a.amount for a in project_allocations if by_id[a.target_id].kind == 'cashout'), ZERO)
+        reinvested = sum((a.amount for a in project_allocations if by_id[a.target_id].kind == 'reinvestment'), ZERO)
         result.append(dict(id=str(p.id), institution_id=str(p.institution_id), name=p.name, status=p.status,
                            expected_total=cash(p.expected_total) if p.expected_total is not None else None,
                            invested=cash(invested), returned=cash(repaid), external_funding=cash(sum((e.amount for e in rows if e.kind == 'investment'), ZERO)),
@@ -227,16 +254,19 @@ def workspace(db: DB):
                            net_recovery=cash(repaid - invested), final_gain=cash(repaid - invested) if p.status == 'closed' else None,
                            roi_percent=cash((repaid - invested) / invested * 100) if p.status == 'closed' and invested else None,
                            expected_remaining=cash(max(ZERO, p.expected_total - repaid)) if p.expected_total is not None else None,
-                           has_settlement_difference=any(str(a.target_id) in differences for a in allocations if a.source_id in row_ids),
+                           has_settlement_difference=any(str(a.target_id) in differences for a in project_allocations),
                            traced_to_bank_payout=cash(cashout), traced_to_reinvestment=cash(reinvested),
                            untraced_returns=cash(repaid - cashout - reinvested)))
-    source_rows = list(db.execute(select(InvestmentSource, InvestmentImport).join(InvestmentImport)))
+    source_rows = list(db.execute(select(InvestmentSource, InvestmentImport.id, InvestmentImport.filename, InvestmentImport.status).join(InvestmentImport)))
+    sources_by_event = defaultdict(list)
+    for source, import_id, filename, status in source_rows:
+        sources_by_event[source.event_id].append(dict(import_id=str(import_id), filename=filename, ordinal=source.ordinal))
     sequences = {}
-    for source, report in sorted(source_rows, key=lambda pair: (str(pair[0].import_id), pair[0].ordinal)):
-        if report.status == 'confirmed': sequences.setdefault(report.id, []).append(source.event_id)
+    for source, import_id, _, status in sorted(source_rows, key=lambda pair: (str(pair[0].import_id), pair[0].ordinal)):
+        if status == 'confirmed': sequences.setdefault(import_id, []).append(source.event_id)
     ordered = []
     for institution in institutions:
-        own = [e for e in events if e.institution_id == institution.id]
+        own = events_by_institution[institution.id]
         ids = {e.id for e in own}
         rows, _ = ordered_events(own, [seq for seq in sequences.values() if seq and seq[0] in ids])
         ordered.extend(rows or own)
@@ -244,15 +274,19 @@ def workspace(db: DB):
     views = []
     for e in events:
         views.append(dict(event_view(e), difference=differences.get(str(e.id)), allocated_out=cash(outgoing.get(e.id, ZERO)), allocated_in=cash(incoming.get(e.id, ZERO)), bank_linked=cash(bank.get(e.id, ZERO)),
-                          sources=[dict(import_id=str(s.import_id), filename=d.filename, ordinal=s.ordinal) for s, d in source_rows if s.event_id == e.id]))
+                          sources=sources_by_event[e.id]))
     latest_reports = {}
-    for report in db.scalars(select(InvestmentImport).where(InvestmentImport.status == 'confirmed').order_by(InvestmentImport.created_at)):
+    # Extract only wallet metadata in PostgreSQL, rather than transferring every
+    # report's parsed rows again. JSON negative indexing selects the last row.
+    reports = db.execute(select(InvestmentImport.institution_id, InvestmentImport.parsed['closing_wallet'].astext.label('balance'),
+        InvestmentImport.parsed['rows'][-1]['posting_date'].astext.label('as_of')).where(InvestmentImport.status == 'confirmed').order_by(InvestmentImport.created_at))
+    for report in reports:
         latest = latest_reports.get(report.institution_id)
-        if latest is None or report.parsed['rows'][-1]['posting_date'] >= latest.parsed['rows'][-1]['posting_date']:
+        if latest is None or report.as_of >= latest.as_of:
             latest_reports[report.institution_id] = report
     return dict(institutions=[dict(id=str(i.id), name=i.name,
-                                  wallet_balance=latest_reports[i.id].parsed['closing_wallet'] if i.id in latest_reports else None,
-                                  wallet_as_of=latest_reports[i.id].parsed['rows'][-1]['posting_date'] if i.id in latest_reports else None) for i in institutions], projects=result, events=views,
+                                  wallet_balance=latest_reports[i.id].balance if i.id in latest_reports else None,
+                                  wallet_as_of=latest_reports[i.id].as_of if i.id in latest_reports else None) for i in institutions], projects=result, events=views,
                 allocations=[dict(id=str(a.id), source_id=str(a.source_id), target_id=str(a.target_id), amount=cash(a.amount)) for a in allocations],
                 bank_links=[dict(id=str(l.id), event_id=str(l.event_id), transaction_id=str(t.id), amount=cash(l.amount), posting_date=t.posting_date.isoformat(), description=t.description, account=a.label) for l, t, a in bank_links])
 
