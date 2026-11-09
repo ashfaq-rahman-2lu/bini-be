@@ -156,7 +156,7 @@ Tests use the dedicated `*_test` database, now also resetting investment data. `
 
 Migration `0005` adds reconciliation cases with review history and reinvestment group associations, plus provenance, explanations and timestamps on return allocations and bank links. Existing links default to **manual** and are preserved. Their new timestamp records migration time, since their original creation time was not previously recorded. The migration does not generate money links or alter bank transactions/source documents.
 
-Run `alembic upgrade head` before starting the updated API. The initial matching action is **Reconcile now**. CSV and bank-statement confirmation in the frontend subsequently sends a separate reconciliation POST; failure leaves the completed import intact and offers retry. GET endpoints only calculate/read results. New imports and all link/review mutations advance review revisions. Bank confirmations and investment writes share the investment advisory lock, then acquire any account/statement locks in that order.
+Run `alembic upgrade head` before starting the updated API. The initial matching action is **Reconcile now**. Durable CSV and bank-statement confirmation jobs subsequently queue a separate reconciliation operation; failure leaves the completed import intact and offers retry. GET endpoints only calculate/read results. New imports and all link/review mutations advance review revisions. Bank confirmations and investment writes share the investment advisory lock, then acquire any account/statement locks in that order.
 
 The pure service in `app/investment_reconciliation.py` merges confirmed source-ordinal ordering constraints and replays each canonical event once. It rejects conflicting or indeterminate same-day order. Nonzero opening funds with unknown business ownership, negative wallets, inconsistent balances and unresolved consumption block dependent wallet matching. Unallocated money is never presented as confirmed available cash in an unresolved wallet. Bank matching continues independently.
 
@@ -245,7 +245,7 @@ Reference: [Railway Dockerfiles](https://docs.railway.com/builds/dockerfiles), [
 
 Bank statement confirmation retains its loaded source rows and inserts new transactions in a batch, avoiding a database reload and flush for every source occurrence. Revision checks, duplicate decisions, lock ordering, source links, and all writes remain in one database transaction. Failures roll back the entire confirmation; repeating a completed confirmation does not add transactions again. No schema migration is needed for this optimization.
 
-Place Railway and Supabase in nearby regions to reduce database round-trip time. Serverless cold starts can add latency to the first request after inactivity. Netlify's API proxy has a 26-second timeout, including time spent waiting for the backend; a 504 does not establish whether a confirmation committed. Refresh the import status before retrying. For consistently longer operations, use asynchronous jobs with status polling, or the same-site HTTPS custom-domain setup documented in the frontend README to call Railway directly without Netlify's API proxy.
+Place Railway and Supabase in nearby regions to reduce database round-trip time. Serverless cold starts can add latency to the first request after inactivity. Netlify's API proxy has a 26-second timeout, including time spent waiting for the backend; a 504 does not establish whether a confirmation committed. Refresh the import status before retrying. The frontend now submits confirmation and reconciliation as durable jobs with short status requests; their processing no longer occupies one long Netlify proxy request. Source-file upload/preview and manual review endpoints retain their existing synchronous contracts.
 
 ## Request timing logs and Better Stack
 
@@ -270,3 +270,49 @@ Only the dedicated timing logger is sent to Better Stack using its official `log
 In Better Stack Live tail, inspect the structured `request` fields. Filter or chart `request.duration_ms` by `request.route` and `request.status_code`; use p50/p95 timings, error counts, and `request.id` to investigate slow confirmations without logging financial payloads. The same fields are present in Railway's JSON stdout logs even before a Better Stack source is configured.
 
 Reference: [Better Stack Python setup and handler options](https://betterstack.com/docs/logs/python/).
+
+
+## Performance and durable operations
+
+Investment confirmation batches projects, events and source links in FK order with explicit UUIDs and a constant number of flush phases. Existing-event reuse, repeated occurrences, replacement acknowledgments, closed-project checks, revision checks and atomic rollback are retained. Reconciliation loads nine datasets once per run and reuses that request-local snapshot after its own writes. It replays only when links/allocations/groups change, then updates persisted cases and the revision without a third analysis. Bank candidates are grouped by remaining amount and direction across **all** institutions; ambiguity/capacity checks and bounded wallet searches are unchanged.
+
+Workspace reads group events, sources and allocations in memory. Source joins fetch report metadata without repeating parsed CSV JSON; wallet summaries extract just the closing balance/date in PostgreSQL. The import list also omits parsed documents. The frontend installs returned review/reconciliation results in its cache and refreshes dependent workspace views once after reconciliation instead of fetching the workspace both before and after it.
+
+### Deploying this version
+
+1. Deploy the backend first. The existing Docker start command runs Alembic migration **0006**, adding `operation_jobs` to the same Supabase database. No changes to financial tables or existing records are required.
+2. `JOBS_ENABLED` defaults to `true`. Keep it enabled on the API service that receives `/api/jobs` requests. A single embedded worker processes jobs in the existing Railway service; no Redis, extra paid worker service, new credentials or persistent volume are required. The queue holds no database connection and performs no periodic queries when empty. New submissions/status requests wake it immediately; startup scans recover queued work. Retry delays only run while queued work exists. This design permits the API process to be suspended while idle; background work still needs the service running to finish. A restart recovers unfinished transactions.
+3. Deploy the frontend after the backend is healthy. Keep `BACKEND_URL` and `/api` cookie proxy configuration as before. The older synchronous confirmation/reconciliation routes remain available for existing clients.
+4. Check one CSV confirmation, one bank confirmation, **Reconcile now**, and refreshing a page during confirmation. There should be a short `POST /api/jobs` returning 202, followed by short `GET /api/jobs/{id}` requests. A queued job can represent an operation actively running under a database row lock; it is intentionally not marked complete until the financial transaction commits.
+5. Compare Railway and Supabase regions manually in their dashboards and choose nearby regions if needed. No region/account settings are changed by this code. Compare the first call after inactivity with subsequent calls separately; application timings exclude container startup before the request enters the server.
+
+Queue operations require the existing signed-in cookie and POST protection header. Supported submissions:
+
+```json
+{"kind":"investment_confirm","target_id":"<import-uuid>","parameters":{"expected_revision":0,"acknowledge_warnings":true,"acknowledge_replace":false}}
+```
+
+Use `bank_confirm` with the bank review's `expected_revision`, or `{"kind":"reconcile"}` without a target/parameters. `GET /api/jobs?kind=investment_confirm&target_id=<uuid>` returns the latest job for page recovery. `GET /api/jobs/{id}` returns status, attempts, a typed result on success, or an error status/detail on failure. Decimal amounts in results remain strings. The browser resumes queued work after reload, retries transient polling failures, and refreshes the current review for jobs that already finished. A lost connection does not cancel accepted work.
+
+One active confirmation per kind/target is enforced in PostgreSQL, and repeated identical confirmations reuse their job. Concurrent manual reconciliation submissions coalesce. Each successful confirmation durably queues its own idempotent follow-up reconciliation before committing; the browser polls that operation instead of submitting a second copy. Follow-ups and manual runs share the existing global financial write lock. Workers use `FOR UPDATE SKIP LOCKED` and commit financial writes and the final result **in the same transaction**. A worker killed before commit leaves the job queued and all partial writes rolled back. Unexpected failures roll back and retry up to three times with a delay. Validation/stale-revision failures do not retry; refresh the review and submit new parameters. `POST /api/jobs/{id}/retry` requeues only a terminal unexpected failure. Confirmations and reconciliation retain their existing financial write locks and idempotency checks. Completing an import and completing its separate reconciliation job are separate transactions; a failed reconciliation never undoes a saved import. The confirmation result includes `reconciliation_job_id`; its follow-up runs even if the browser closes before receiving that result.
+
+Completed/failed jobs and result copies are retained for seven days, then removed when an active worker next performs maintenance. Queued jobs are never purged. Financial records/source documents are unaffected. This retention bounds duplicate result storage; it is not the financial audit history. A completed confirmation remains idempotent even after its job record expires.
+
+### Detailed timing fields in Better Stack
+
+Request completion events now include `performance`. Job completion/attempt events use the same stdout/Better Stack logger and include `job.id`, `job.kind`, `job.status`, `job.attempts`, `job.duration_ms`, `job.queue_ms` and the exception **class** on failure. No job payload, results, financial record IDs, SQL, query parameters or exception messages are logged. `job.id` is the opaque operation ID returned to the browser, not a financial record ID.
+
+`performance` contains fields when that phase runs:
+
+- `query_count`, `query_ms`, `query_errors`: DBAPI executions (a batched execution counts once), elapsed execution/round-trip time, and execution failures. They exclude ORM materialization/JSON response encoding and pool pre-ping calls.
+- `connection_count`, `connection_ms`: pool acquisition including wait, physical connection setup and pre-ping. This is a combined acquisition measurement, not a claim about PostgreSQL's internal connection wait.
+- `lock_wait_ms`, `row_lock_wait_ms`: elapsed advisory-lock and account/statement-lock round trips, respectively, including network/database execution. These are not PostgreSQL's isolated lock-wait counters.
+- `flush_ms`, `commit_ms`, `investment_write_ms`, `bank_import_write_ms`: persistence phases.
+- `csv_parse_ms`, `pdf_parse_ms`, `bank_review_ms`, `investment_preview_ms`, `investment_workspace_ms`, `reconciliation_load_ms`, `reconciliation_compute_ms`, `reconciliation_ms`: parsing, read-model and matching phases.
+- `process_uptime_ms` on HTTP events: process age when the request began, useful for distinguishing newly started instances from warm ones; it does not measure cold-start duration.
+
+Phase timings overlap (for example a flush includes DB executions); **do not add them together**. Background jobs have their own timing context, so their work is not attributed to the short submission/polling request. Existing request timing fields continue to cover every HTTP route. Use `job.duration_ms` grouped by `job.kind` for confirmation/reconciliation performance, and `request.duration_ms` grouped by `request.route` for API response latency. Compare query counts, phase timings and financial results on the same representative reports before/after deployment. Production speedups depend on data size, region latency, cold starts and contention; local timings do not predict them.
+
+Synthetic regression tests exercise 250-row batching, constant reconciliation reads, exact result equality, rollback, stale revisions, duplicate jobs, competing consumers and crash recovery. They use only the dedicated `_test` database. Browser tests exercise real jobs plus refresh recovery and transient polling failures.
+
+References: [SQLAlchemy execution events](https://docs.sqlalchemy.org/en/20/core/events.html), [PostgreSQL queue locking](https://www.postgresql.org/docs/current/sql-select.html), [FastAPI lifespan](https://fastapi.tiangolo.com/advanced/events/).

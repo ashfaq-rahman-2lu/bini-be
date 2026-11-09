@@ -25,12 +25,15 @@ from .models import Account, SourceLink, Statement, StatementRow, Transaction
 from .schemas import AccountView, Confirmation, Decisions, ImportSummary, ImportView, TransactionList
 from .investments import router as investment_router, lock as investment_lock
 from .reconciliation_api import router as reconciliation_router
+from .jobs import lifespan, router as jobs_router
+from .performance import phase
 
-app = FastAPI(title="Bini · Bank statement ledger", version="0.1.0")
+app = FastAPI(title="Bini · Bank statement ledger", version="0.1.0", lifespan=lifespan)
 app.include_router(auth_router)
 protected = APIRouter(dependencies=[Depends(require_auth)])
 protected.include_router(investment_router)
 protected.include_router(reconciliation_router)
+protected.include_router(jobs_router)
 app.add_middleware(CORSMiddleware, allow_origins=settings.allowed_origins,
                    allow_methods=["GET", "POST", "PATCH", "DELETE"], allow_headers=["Content-Type", "X-Bini-Request"], allow_credentials=True)
 @app.middleware("http")
@@ -59,8 +62,9 @@ def statement_or_404(db, statement_id, lock=False):
         raise HTTPException(404, "Import not found.")
     if lock:
         # All modifying paths lock account then statement in the same order.
-        db.scalar(select(Account).where(Account.id == statement.account_id).with_for_update().execution_options(populate_existing=True))
-        statement = db.scalar(select(Statement).where(Statement.id == statement_id).with_for_update().execution_options(populate_existing=True))
+        with phase('row_lock_wait'):
+            db.scalar(select(Account).where(Account.id == statement.account_id).with_for_update().execution_options(populate_existing=True))
+            statement = db.scalar(select(Statement).where(Statement.id == statement_id).with_for_update().execution_options(populate_existing=True))
         if statement is None:
             raise HTTPException(404, "Import not found.")
     return statement
@@ -113,7 +117,10 @@ def upload(db: DB, file: UploadFile = File(...), password: str = Form("")):
     previous = db.scalar(select(Statement).where(Statement.fingerprint == fingerprint))
     if previous:
         return review(db, previous)
-    parsed = process_pdf(data, password)
+    # Release the lookup connection before CPU/subprocess parsing.
+    db.rollback()
+    with phase('pdf_parse'):
+        parsed = process_pdf(data, password)
     del password
     try:
         statement = persist_import(db, file, data, fingerprint, parsed)
@@ -125,6 +132,7 @@ def upload(db: DB, file: UploadFile = File(...), password: str = Form("")):
     return review(db, statement)
 
 
+@phase('bank_import_write')
 def persist_import(db, file, data, fingerprint, parsed):
     account_id = db.scalar(insert(Account).values(
         id=uuid.uuid4(), bank="EBL", identifier=parsed["identifier"], currency="BDT",
@@ -174,6 +182,10 @@ def decisions(statement_id: uuid.UUID, body: Decisions, db: DB):
 
 @protected.post("/api/imports/{statement_id}/confirm", response_model=ImportView)
 def confirm(statement_id: uuid.UUID, body: Confirmation, db: DB):
+    return confirm_import(statement_id, body, db)
+
+
+def confirm_import(statement_id, body, db, *, commit=True):
     # A new bank occurrence can change uniqueness in an investment review.
     # Take the shared lock first, before the existing account/statement locks.
     investment_lock(db)
@@ -207,7 +219,10 @@ def confirm(statement_id: uuid.UUID, body: Confirmation, db: DB):
         db.add(SourceLink(transaction_id=target, statement_row_id=row.id))
     statement.status = "confirmed"
     db.get(Account, statement.account_id).revision += 1
-    db.commit()
+    if commit:
+        db.commit()
+    else:
+        db.flush()
     return review(db, statement, rows=rows)
 
 
