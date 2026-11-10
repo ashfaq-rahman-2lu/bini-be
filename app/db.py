@@ -25,6 +25,14 @@ class TimedSession(Session):
         with phase('commit'):
             return super().commit()
 
+    def close(self):
+        with phase("transaction_cleanup"):
+            return super().close()
+
+    def rollback(self):
+        with phase("transaction_cleanup"):
+            return super().rollback()
+
     def flush(self, objects=None):
         with phase('flush'):
             return super().flush(objects)

@@ -65,8 +65,8 @@ def test_reconcile_loads_once_and_returns_the_same_fresh_snapshot(client):
     finally:
         event.remove(engine, 'before_cursor_execute', record)
     assert response.status_code == 200
-    # Nine datasets plus the existing advisory lock; no reload after writes.
-    assert len(statements) == 10
+    # Seven joined datasets plus the advisory lock; no reload after writes.
+    assert len(statements) == 8
     assert all('investment_imports.parsed' not in sql and 'original_csv' not in sql for sql in statements)
     result = response.json(); result.pop('saved')
     assert result == client.get('/api/investments/reconciliation').json()

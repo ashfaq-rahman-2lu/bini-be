@@ -40,3 +40,27 @@ def test_sql_counts_phases_and_context_isolation_exclude_parameters():
     assert current_timings.get() is None
     assert 'sensitive-financial-value' not in output.getvalue()
     assert 'SELECT' not in output.getvalue()
+
+
+def test_encoding_cleanup_and_snapshot_metrics_are_payload_free():
+    from app.request_logging import TimedJSONResponse
+    from app.reconciliation_api import load_analysis
+    output = io.StringIO()
+    logger = logging.Logger('test.new.timings')
+    handler = logging.StreamHandler(output)
+    handler.setFormatter(RequestJSONFormatter())
+    logger.addHandler(handler)
+    app = FastAPI(default_response_class=TimedJSONResponse)
+    @app.get('/timed')
+    def timed():
+        with SessionLocal() as db:
+            load_analysis(db)
+        return {'ok': True}
+    app.add_middleware(RequestTimingMiddleware, logger=logger)
+    with TestClient(app) as client:
+        assert client.get('/timed').status_code == 200
+    stats = json.loads(output.getvalue())['performance']
+    assert stats['reconciliation_load_count'] == 1
+    assert stats['response_serialization_ms'] >= 0
+    assert stats['transaction_cleanup_ms'] >= 0
+    assert 'SELECT' not in output.getvalue()

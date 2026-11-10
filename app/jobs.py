@@ -18,7 +18,7 @@ from typing import Literal
 from fastapi import APIRouter, HTTPException
 from fastapi.encoders import jsonable_encoder
 from pydantic import BaseModel, Field
-from sqlalchemy import delete, func, or_, select
+from sqlalchemy import case, delete, func, or_, select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.exc import IntegrityError
 
@@ -74,13 +74,13 @@ def submit(body: Submission, db: DB):
         job = db.scalar(select(Job).where(or_(Job.dedupe_key == dedupe_key, Job.active_key == active_key)))
         if job:
             return job_view(job)
-        identity = db.scalar(insert(Job).values(id=uuid.uuid4(), kind=body.kind, target_id=body.target_id,
+        job = db.scalar(insert(Job).values(id=uuid.uuid4(), kind=body.kind, target_id=body.target_id,
             payload=payload, status='queued', attempts=0, active_key=active_key, dedupe_key=dedupe_key)
-            .on_conflict_do_nothing().returning(Job.id))
-        if identity:
+            .on_conflict_do_nothing().returning(Job))
+        if job:
             db.commit()
             wakeup.set()
-            return job_view(db.get(Job, identity))
+            return job_view(job)
         job = db.scalar(select(Job).where(or_(Job.dedupe_key == dedupe_key, Job.active_key == active_key)))
         if job:
             return job_view(job)
@@ -100,7 +100,12 @@ def active(db: DB, kind: Literal['investment_confirm', 'bank_confirm', 'reconcil
 @router.get('/{identity}')
 def status(identity: uuid.UUID, db: DB):
     wakeup.set()
-    return job_view(find(db, Job, identity), include_result=True)
+    columns = [Job.id, Job.kind, Job.target_id, Job.status, Job.attempts, Job.created_at,
+        Job.error_status, Job.error_detail, case((Job.status == 'succeeded', Job.result), else_=None).label('result')]
+    row = db.execute(select(*columns).where(Job.id == identity)).one_or_none()
+    if row is None:
+        raise HTTPException(404, 'Investment record not found.')
+    return job_view(row, include_result=True)
 
 
 @router.post('/{identity}/retry', status_code=202)
