@@ -9,7 +9,14 @@ from time import perf_counter
 from urllib.parse import urlsplit
 
 from .config import settings
-from .performance import Timings, current_timings
+from .performance import Timings, current_timings, phase
+from starlette.responses import JSONResponse
+
+
+class TimedJSONResponse(JSONResponse):
+    def render(self, content):
+        with phase("response_serialization"):
+            return super().render(content)
 
 PROCESS_STARTED = perf_counter()
 

@@ -22,8 +22,8 @@ def transaction_view(row):
 
 
 @phase('bank_review')
-def review(session, statement, *, rows=None):
-    account = session.get(Account, statement.account_id)
+def review(session, statement, *, rows=None, account=None):
+    account = account if account is not None else session.get(Account, statement.account_id)
     if rows is None:
         rows = list(session.scalars(select(StatementRow).where(StatementRow.statement_id == statement.id).order_by(StatementRow.ordinal)))
     # Scope the lookup to the imported period, not the entire ledger.

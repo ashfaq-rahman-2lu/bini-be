@@ -58,8 +58,8 @@ def event_view(event):
 
 
 @phase('investment_preview')
-def preview(db, draft):
-    institution = find(db, Institution, draft.institution_id)
+def preview(db, draft, institution=None):
+    institution = institution if institution is not None else find(db, Institution, draft.institution_id)
     replacing = draft.mode == 'replace' and draft.status == 'draft'
     existing = {} if replacing else {(e.signature, e.occurrence): str(e.id) for e in db.scalars(select(InvestmentEvent).where(InvestmentEvent.institution_id == institution.id))}
     rows = [dict(r, existing_id=existing.get((r['signature'], r['occurrence']))) for r in draft.parsed['rows']]
@@ -95,8 +95,10 @@ def upload(db: DB, file: UploadFile = File(...), institution: str = Form('Biniyo
     except CSVError as exc:
         raise HTTPException(422, str(exc)) from None
     lock(db)
-    db.execute(insert(Institution).values(id=uuid.uuid4(), name=name, revision=0).on_conflict_do_nothing(index_elements=['name']))
-    owner = db.scalar(select(Institution).where(Institution.name == name))
+    owner = db.scalar(insert(Institution).values(id=uuid.uuid4(), name=name, revision=0)
+        .on_conflict_do_nothing(index_elements=['name']).returning(Institution))
+    if owner is None:
+        owner = db.scalar(select(Institution).where(Institution.name == name))
     fingerprint = hashlib.sha256(data).hexdigest()
     query = select(InvestmentImport).where(InvestmentImport.institution_id == owner.id, InvestmentImport.fingerprint == fingerprint, InvestmentImport.mode == mode)
     if mode == 'replace':
@@ -107,7 +109,7 @@ def upload(db: DB, file: UploadFile = File(...), institution: str = Form('Biniyo
                                  filename=Path((file.filename or 'transactions.csv').replace('\\', '/')).name[:255], original_csv=data, parsed=parsed, mode=mode)
         db.add(draft)
         db.flush()
-    result = preview(db, draft)
+    result = preview(db, draft, owner)
     db.commit()
     return result
 
@@ -211,8 +213,18 @@ def cancel(identity: uuid.UUID, db: DB):
 def workspace(db: DB):
     # One consistent snapshot for totals, links and available allocation amounts.
     db.connection(execution_options={'isolation_level': 'REPEATABLE READ'})
-    institutions = list(db.scalars(select(Institution).order_by(Institution.name)))
-    projects = list(db.scalars(select(InvestmentProject).order_by(InvestmentProject.name)))
+    reports = select(InvestmentImport.institution_id,
+        InvestmentImport.parsed['closing_wallet'].astext.label('balance'),
+        InvestmentImport.parsed['rows'][-1]['posting_date'].astext.label('as_of')).where(
+        InvestmentImport.status == 'confirmed').distinct(InvestmentImport.institution_id).order_by(
+        InvestmentImport.institution_id, InvestmentImport.parsed['rows'][-1]['posting_date'].astext.desc(),
+        InvestmentImport.created_at.desc()).subquery()
+    headers = list(db.execute(select(Institution, InvestmentProject, reports.c.balance, reports.c.as_of)
+        .outerjoin(InvestmentProject, InvestmentProject.institution_id == Institution.id)
+        .outerjoin(reports, reports.c.institution_id == Institution.id).order_by(Institution.name, InvestmentProject.name)))
+    institutions = list({i.id: i for i, _, _, _ in headers}.values())
+    projects = sorted([p for _, p, _, _ in headers if p is not None], key=lambda p: p.name)
+    latest_reports = {i.id: dict(balance=balance, as_of=as_of) for i, _, balance, as_of in headers if as_of is not None}
     events = list(db.scalars(select(InvestmentEvent).order_by(InvestmentEvent.posting_date, InvestmentEvent.id)))
     allocations = list(db.scalars(select(ReturnAllocation)))
     bank_links = list(db.execute(select(InvestmentBankLink, Transaction, Account).select_from(InvestmentBankLink)
@@ -275,18 +287,9 @@ def workspace(db: DB):
     for e in events:
         views.append(dict(event_view(e), difference=differences.get(str(e.id)), allocated_out=cash(outgoing.get(e.id, ZERO)), allocated_in=cash(incoming.get(e.id, ZERO)), bank_linked=cash(bank.get(e.id, ZERO)),
                           sources=sources_by_event[e.id]))
-    latest_reports = {}
-    # Extract only wallet metadata in PostgreSQL, rather than transferring every
-    # report's parsed rows again. JSON negative indexing selects the last row.
-    reports = db.execute(select(InvestmentImport.institution_id, InvestmentImport.parsed['closing_wallet'].astext.label('balance'),
-        InvestmentImport.parsed['rows'][-1]['posting_date'].astext.label('as_of')).where(InvestmentImport.status == 'confirmed').order_by(InvestmentImport.created_at))
-    for report in reports:
-        latest = latest_reports.get(report.institution_id)
-        if latest is None or report.as_of >= latest.as_of:
-            latest_reports[report.institution_id] = report
     return dict(institutions=[dict(id=str(i.id), name=i.name,
-                                  wallet_balance=latest_reports[i.id].balance if i.id in latest_reports else None,
-                                  wallet_as_of=latest_reports[i.id].as_of if i.id in latest_reports else None) for i in institutions], projects=result, events=views,
+                                  wallet_balance=latest_reports[i.id]['balance'] if i.id in latest_reports else None,
+                                  wallet_as_of=latest_reports[i.id]['as_of'] if i.id in latest_reports else None) for i in institutions], projects=result, events=views,
                 allocations=[dict(id=str(a.id), source_id=str(a.source_id), target_id=str(a.target_id), amount=cash(a.amount)) for a in allocations],
                 bank_links=[dict(id=str(l.id), event_id=str(l.event_id), transaction_id=str(t.id), amount=cash(l.amount), posting_date=t.posting_date.isoformat(), description=t.description, account=a.label) for l, t, a in bank_links])
 

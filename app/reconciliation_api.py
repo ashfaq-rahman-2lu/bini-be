@@ -3,6 +3,7 @@ import hashlib
 import json
 import uuid
 from collections import defaultdict
+from copy import deepcopy
 from datetime import date, datetime, timezone
 from decimal import Decimal
 from types import SimpleNamespace
@@ -12,7 +13,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.orm import load_only
 
-from .performance import phase
+from .performance import phase, current_timings
 
 from .investment_models import (Institution, InvestmentBankLink, InvestmentEvent, InvestmentImport,
     InvestmentProject, InvestmentSource, ReconciliationCase, ReinvestmentAssociation, ReturnAllocation)
@@ -31,19 +32,67 @@ def revision_token(owners, accounts):
     return hashlib.sha256(json.dumps([[(str(i.id), i.revision) for i in owners], [(str(a.id), a.revision) for a in accounts]], sort_keys=True).encode()).hexdigest()
 
 
+class ReconciliationSnapshot:
+    """Isolated scalar records and identity maps; simulation never touches a Session."""
+    collections = {Institution: 'owners', InvestmentEvent: 'events', ReturnAllocation: 'allocations',
+        ReinvestmentAssociation: 'associations', InvestmentBankLink: 'links', ReconciliationCase: 'cases',
+        Account: 'accounts', Transaction: 'bank'}
+
+    def __init__(self, data):
+        self.originals, self.records = {}, {}
+        def clone(row):
+            key = (type(row), row.id)
+            if key not in self.records:
+                self.originals[key] = row
+                # Only loaded columns: never trigger lazy loading of documents.
+                self.records[key] = type(row)(**deepcopy({k: v for k, v in vars(row).items() if not k.startswith('_')}))
+            return self.records[key]
+        self.data = {key: [tuple(clone(r) for r in row) if key == 'sources' else clone(row)
+                          for row in rows] for key, rows in data.items()}
+
+    def __getitem__(self, key):
+        return self.data[key]
+
+    def get(self, model, identity):
+        return self.records.get((model, identity))
+
+    def add(self, row):
+        row.id = row.id or uuid.uuid4()
+        if hasattr(type(row), 'created_at') and row.created_at is None:
+            row.created_at = datetime.now(timezone.utc)
+        self.records[type(row), row.id] = row
+        self.data[self.collections[type(row)]].append(row)
+
+    def persist(self, db):
+        for key, row in self.records.items():
+            original = self.originals.get(key)
+            if original is None:
+                db.add(row)
+            else:
+                for name, value in vars(row).items():
+                    if not name.startswith('_') and value != getattr(original, name):
+                        setattr(original, name, deepcopy(value))
+        db.flush()
+
+
 def load_analysis(db):
-    # One request-local snapshot. No shared cache can hide cross-institution
-    # capacity changes; all reconciliation writes hold the existing global lock.
+    stats = current_timings.get()
+    if stats is not None:
+        stats.add('reconciliation_load_count', 1)
     with phase('reconciliation_load'):
+        owner_rows = list(db.execute(select(Institution, InvestmentEvent).outerjoin(InvestmentEvent,
+            InvestmentEvent.institution_id == Institution.id).order_by(Institution.id)))
+        bank_rows = list(db.execute(select(Account, Transaction).outerjoin(Transaction,
+            Transaction.account_id == Account.id).order_by(Account.id)))
         return dict(
-            owners=list(db.scalars(select(Institution).order_by(Institution.id))),
-            events=list(db.scalars(select(InvestmentEvent))),
+            owners=list({o.id: o for o, _ in owner_rows}.values()),
+            events=[e for _, e in owner_rows if e is not None],
             allocations=list(db.scalars(select(ReturnAllocation))),
             associations=list(db.scalars(select(ReinvestmentAssociation))),
             links=list(db.scalars(select(InvestmentBankLink))),
             cases=list(db.scalars(select(ReconciliationCase))),
-            accounts=list(db.scalars(select(Account).order_by(Account.id))),
-            bank=list(db.scalars(select(Transaction))),
+            accounts=list({a.id: a for a, _ in bank_rows}.values()),
+            bank=[t for _, t in bank_rows if t is not None],
             sources=list(db.execute(select(InvestmentSource, InvestmentImport).join(InvestmentImport)
                 .options(load_only(InvestmentImport.id, InvestmentImport.filename, InvestmentImport.status))
                 .where(InvestmentImport.status == 'confirmed').order_by(InvestmentSource.import_id, InvestmentSource.ordinal))))
@@ -229,27 +278,33 @@ def public_snapshot(context):
 
 @phase('reconciliation')
 def reconcile(db):
-    data = load_analysis(db)
+    snapshot = ReconciliationSnapshot(load_analysis(db))
+    result = reconcile_snapshot(snapshot)
+    snapshot.persist(db)
+    return result
+
+
+def reconcile_snapshot(db):
+    data = db
     context = analyze(db, data)
     changed, counts = set(), dict(allocations=0, bank_links=0, associations=0)
     existing = {(str(a.source_id), str(a.target_id)) for a in context['allocations']}
     for p in context['proposals']:
         if (p['source_id'], p['target_id']) in existing: continue
         item = ReturnAllocation(source_id=uuid.UUID(p['source_id']), target_id=uuid.UUID(p['target_id']), amount=Decimal(p['amount']), provenance='automatic', explanation=p['explanation'])
-        db.add(item); data['allocations'].append(item)
+        db.add(item)
         changed.add(p['institution_id']); counts['allocations'] += 1
     existing_groups = {(str(a.funding_id), str(a.event_id)) for a in context['associations']}
     for g in context['groups']:
         for key in g['event_ids']:
             if (g['funding_id'], key) in existing_groups: continue
             item = ReinvestmentAssociation(funding_id=uuid.UUID(g['funding_id']), event_id=uuid.UUID(key), provenance='automatic', explanation='Unique destination funding and settlement group.')
-            db.add(item); data['associations'].append(item)
+            db.add(item)
             changed.add(g['institution_id']); counts['associations'] += 1
     for p in context['bank_proposals']:
         item = InvestmentBankLink(event_id=uuid.UUID(p['event_id']), transaction_id=uuid.UUID(p['transaction_id']), amount=Decimal(p['amount']), provenance='automatic', explanation=p['explanation'])
-        db.add(item); data['links'].append(item)
+        db.add(item)
         changed.add(p['institution_id']); counts['bank_links'] += 1
-    db.flush()
     # Store issues from the resulting state, not those just resolved by proposals.
     after = analyze(db, data) if any(counts.values()) else context
     saved = {(str(c.institution_id), c.key): c for c in after['cases']}
@@ -260,7 +315,7 @@ def reconcile(db):
         if not case:
             case = ReconciliationCase(institution_id=uuid.UUID(key[0]), key=key[1], event_id=uuid.UUID(issue['event_id']) if issue['event_id'] else None,
                                       kind=issue['kind'], status='open', details=issue, resolutions=[])
-            db.add(case); data['cases'].append(case)
+            db.add(case)
             changed.add(key[0])
         elif case.status != 'open' or case.details != issue:
             case.status, case.details, case.resolved_at = 'open', issue, None
@@ -270,7 +325,6 @@ def reconcile(db):
             case.status, case.resolved_at = 'resolved', datetime.now(timezone.utc); changed.add(key[0])
     for owner in after['owners']:
         if str(owner.id) in changed: owner.revision += 1
-    db.flush()
     # Case status/details do not alter proposals or accepted differences. Keep
     # newly persisted case IDs and the new revision without a third replay/read.
     after['token'] = revision_token(data['owners'], data['accounts'])
@@ -313,8 +367,7 @@ class Resolution(BaseModel):
 
 
 def apply_resolution(identity: uuid.UUID, body: Resolution, db):
-    lock(db)
-    before = analyze(db)
+    before = analyze(db, db)
     if before['token'] != body.expected_revision:
         raise HTTPException(409, 'Investment or bank data changed. Refresh reconciliation before saving this review.')
     case = find(db, ReconciliationCase, identity)
@@ -371,8 +424,7 @@ def apply_resolution(identity: uuid.UUID, body: Resolution, db):
     if body.delayed_booking and (event.kind != 'reinvestment' or not body.allocations):
         raise HTTPException(422, 'Delayed booking requires a reinvestment and the actual source credits.')
     case.resolutions = case.resolutions + [dict(body.model_dump(mode='json', exclude={'expected_revision'}), difference=cash(difference), reviewed_at=datetime.now(timezone.utc).isoformat(), evidence=case.details)]
-    db.flush()
-    checked = analyze(db)
+    checked = analyze(db, db)
     bad = [i for i in checked['issues'] if i['event_id'] == str(event.id) and (i['kind'].startswith('bank_') if case.kind == 'bank_match' else not i['kind'].startswith('bank_'))]
     if case.kind == 'reinvestment_group':
         # Resolve grouping first; attribution/delayed booking may then need a
@@ -384,23 +436,23 @@ def apply_resolution(identity: uuid.UUID, body: Resolution, db):
     if bad: raise HTTPException(422, bad[0]['message'])
     case.status, case.resolved_at = 'resolved', datetime.now(timezone.utc)
     find(db, Institution, event.institution_id).revision += 1
-    result = reconcile(db)
+    result = reconcile_snapshot(db)
     return result
 
 
 @router.post('/reconciliation/cases/{identity}/preview')
 def preview_resolution(identity: uuid.UUID, body: Resolution, db: DB):
-    # Exercise the same validation and cascading matching as the final save.
-    # Always roll back, including on validation failures; release the write lock.
-    try:
-        return apply_resolution(identity, body, db)
-    finally:
-        db.rollback()
+    db.connection(execution_options={'isolation_level': 'REPEATABLE READ'})
+    snapshot = ReconciliationSnapshot(load_analysis(db))
+    return apply_resolution(identity, body, snapshot)
 
 
 @router.patch('/reconciliation/cases/{identity}')
 def resolve(identity: uuid.UUID, body: Resolution, db: DB):
-    result = apply_resolution(identity, body, db)
+    lock(db)
+    snapshot = ReconciliationSnapshot(load_analysis(db))
+    result = apply_resolution(identity, body, snapshot)
+    snapshot.persist(db)
     db.commit()
     return result
 
@@ -417,7 +469,10 @@ def remove_association(identity: uuid.UUID, db: DB):
 @router.get('/projects/{identity}/trail')
 def trail(identity: uuid.UUID, db: DB):
     db.connection(execution_options={'isolation_level': 'REPEATABLE READ'})
-    project = find(db, InvestmentProject, identity)
+    projects = list(db.scalars(select(InvestmentProject)))
+    project = next((p for p in projects if p.id == identity), None)
+    if project is None:
+        raise HTTPException(404, 'Investment record not found.')
     context = analyze(db)
     own = {str(e.id) for e in context['events'] if e.project_id == project.id}
     allocations = [a for a in context['allocations'] if str(a.source_id) in own or str(a.target_id) in own]
@@ -429,7 +484,7 @@ def trail(identity: uuid.UUID, db: DB):
     # Include group members, but do not traverse the other business's later returns.
     associations = [a for a in context['associations'] if str(a.funding_id) in related]
     related.update(str(a.event_id) for a in associations)
-    names = {str(p.id): p.name for p in db.scalars(select(InvestmentProject))}
+    names = {str(p.id): p.name for p in projects}
     wallet = context['wallets'][str(project.institution_id)]
     rows = []
     for key in wallet['ordered_ids'] or sorted(related, key=lambda k: (context['by_id'][k].posting_date, k)):

@@ -5,6 +5,7 @@ import subprocess
 import sys
 import uuid
 from datetime import date
+from decimal import Decimal
 from pathlib import Path
 from typing import Annotated, Literal
 from urllib.parse import quote
@@ -17,7 +18,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from .config import settings
-from .request_logging import RequestTimingMiddleware
+from .request_logging import RequestTimingMiddleware, TimedJSONResponse
 from .auth import require_auth, router as auth_router
 from .db import get_db
 from .matching import FIELDS, review, transaction_view
@@ -28,7 +29,7 @@ from .reconciliation_api import router as reconciliation_router
 from .jobs import lifespan, router as jobs_router
 from .performance import phase
 
-app = FastAPI(title="Bini · Bank statement ledger", version="0.1.0", lifespan=lifespan)
+app = FastAPI(title="Bini · Bank statement ledger", version="0.1.0", lifespan=lifespan, default_response_class=TimedJSONResponse)
 app.include_router(auth_router)
 protected = APIRouter(dependencies=[Depends(require_auth)])
 protected.include_router(investment_router)
@@ -123,7 +124,8 @@ def upload(db: DB, file: UploadFile = File(...), password: str = Form("")):
         parsed = process_pdf(data, password)
     del password
     try:
-        statement = persist_import(db, file, data, fingerprint, parsed)
+        statement, account, rows = persist_import(db, file, data, fingerprint, parsed)
+        return review(db, statement, account=account, rows=rows)
     except IntegrityError:
         db.rollback()
         statement = db.scalar(select(Statement).where(Statement.fingerprint == fingerprint))
@@ -134,24 +136,29 @@ def upload(db: DB, file: UploadFile = File(...), password: str = Form("")):
 
 @phase('bank_import_write')
 def persist_import(db, file, data, fingerprint, parsed):
-    account_id = db.scalar(insert(Account).values(
+    account = db.scalar(insert(Account).values(
         id=uuid.uuid4(), bank="EBL", identifier=parsed["identifier"], currency="BDT",
         label="EBL · •••• " + parsed["identifier"][-4:], revision=0,
-    ).on_conflict_do_nothing(index_elements=["bank", "identifier", "currency"]).returning(Account.id))
-    if account_id is None:
-        account_id = db.scalar(select(Account.id).where(Account.bank == "EBL", Account.identifier == parsed["identifier"], Account.currency == "BDT"))
-    statement = Statement(account_id=account_id, fingerprint=fingerprint,
+    ).on_conflict_do_nothing(index_elements=["bank", "identifier", "currency"]).returning(Account))
+    if account is None:
+        account = db.scalar(select(Account).where(Account.bank == "EBL", Account.identifier == parsed["identifier"], Account.currency == "BDT"))
+    statement = Statement(account_id=account.id, fingerprint=fingerprint,
         filename=Path(file.filename or "statement.pdf").name[:255], original_pdf=data,
         period_from=date.fromisoformat(parsed["period_from"]), period_to=date.fromisoformat(parsed["period_to"]),
         opening_balance=parsed["opening_balance"], closing_balance=parsed["closing_balance"],
         controls=parsed["controls"], checks=parsed["checks"])
     db.add(statement)
     db.flush()
+    rows = []
     for source in parsed["rows"]:
         source["posting_date"] = date.fromisoformat(source["posting_date"])
-        db.add(StatementRow(statement_id=statement.id, **source))
+        source["amount"] = Decimal(source["amount"])
+        source["balance"] = Decimal(source["balance"])
+        row = StatementRow(statement_id=statement.id, **source)
+        db.add(row)
+        rows.append(row)
     db.commit()
-    return statement
+    return statement, account, rows
 
 
 @protected.get("/api/imports/{statement_id}", response_model=ImportView)

@@ -316,3 +316,16 @@ Phase timings overlap (for example a flush includes DB executions); **do not add
 Synthetic regression tests exercise 250-row batching, constant reconciliation reads, exact result equality, rollback, stale revisions, duplicate jobs, competing consumers and crash recovery. They use only the dedicated `_test` database. Browser tests exercise real jobs plus refresh recovery and transient polling failures.
 
 References: [SQLAlchemy execution events](https://docs.sqlalchemy.org/en/20/core/events.html), [PostgreSQL queue locking](https://www.postgresql.org/docs/current/sql-select.html), [FastAPI lifespan](https://fastapi.tiangolo.com/advanced/events/).
+
+
+### Diagnosing the remaining database latency
+
+Run `python -m app.db_diagnostics --samples 10` **inside the Railway service** using its existing environment (for example through an existing Railway SSH session). Running it locally measures a different network path. It performs only SELECT 1, transaction rollback, and connection checkouts; it prints numeric timings and exception types, never the connection URL. `railway run` executes locally and is not an equivalent network measurement.
+
+The output separates the initial connection, repeated SELECTs on one connection, repeated pool checkouts, and rollback. High SELECT 1 latency establishes a network/pooler/database floor even for simple SQL; compare it with server-side execution statistics before attributing the delay to geography. No provider settings or connection-health safeguards are changed by this optimization.
+
+`performance.reconciliation_load_count` counts complete snapshot loads. Preview and save now load once. Preview simulates UUIDs, timestamps, decisions and automatic matches on isolated records without SQL writes or advisory locks; save repeats validation under the existing lock and persists the result in one transaction. Preview identifiers are provisional. Read models retain empty accounts/institutions and global competing allocations.
+
+`performance.response_serialization_ms` measures JSONResponse rendering/JSON encoding, not all Pydantic validation or network transfer. `performance.transaction_cleanup_ms` measures explicit rollback and session close. `connection_count` counts pool checkouts, not newly opened physical connections; `connection_ms` includes pool waiting and pre-ping. Phase times overlap and must not be added together. Background operations remain separate `job.duration_ms` events.
+
+Compare the same synthetic reports, SQL call counts, warm HTTP latency, and browser timings before/after. Use unfiltered requests for percentiles; a duration filter cannot establish p95. Release the backend before frontend caching. The frontend reuses workspace, reconciliation and project trails for 30 seconds; mutations invalidate dependent views and logout clears the cache. No schema migration or new environment variable is required.
